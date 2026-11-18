@@ -7,8 +7,21 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
+
+from evaluation import (
+    compute_word_alignment,
+    compute_speech_rate,
+    compute_pause_metrics,
+    detect_candidate_repetitions,
+    compute_repetition_rate,
+    detect_candidate_self_corrections,
+    compute_quantitative_errors,
+    evaluate_event_detection,
+    normalize_transcript,
+)
+from silence_detector import detect_silence_in_wav
 
 # Load environment variables from backend/.env or root .env
 env_path = Path(__file__).parent / ".env"
@@ -387,6 +400,24 @@ async def transcribe_audio(
                 "message": f"Unexpected error during transcription: {str(exc)}",
             },
         )
+        # Run silence detector on audio bytes if WAV format
+        silence_result = None
+        if filename.lower().endswith(".wav"):
+            silence_result = detect_silence_in_wav(
+                audio_content,
+                min_pause_duration_seconds=0.25,
+                silence_threshold_db=-35.0,
+            )
+        else:
+            silence_result = {
+                "detected_pauses": [],
+                "pause_count": 0,
+                "total_pause_duration_seconds": 0.0,
+                "mean_pause_duration_seconds": None,
+                "audio_duration_seconds": None,
+                "status": "unavailable",
+                "reason": "Backend signal analysis is optimized for uncompressed PCM WAV. Browser Web Audio API analyzes silence for compressed formats (WebM/MP3/M4A).",
+            }
     finally:
         # Explicitly release memory reference to uploaded audio bytes
         del audio_content
@@ -418,6 +449,7 @@ async def transcribe_audio(
         "disfluencies_enabled": disfluencies,
         "processing_time_sec": elapsed_time,
         "filename": filename,
+        "silence_analysis": silence_result,
         "raw_metadata": {
             "id": completed_data.get("id"),
             "status": completed_data.get("status"),
@@ -430,3 +462,159 @@ async def transcribe_audio(
             "format_text": completed_data.get("format_text"),
         },
     }
+
+
+@app.post("/analyze-silence", summary="Analyze audio signal for silent pauses")
+async def analyze_silence_endpoint(
+    file: UploadFile = File(...),
+    min_pause_duration: float = Form(0.25),
+    silence_threshold_db: float = Form(-35.0),
+):
+    """
+    Independent acoustic signal analysis for silence detection in WAV audio.
+    """
+    try:
+        content = await file.read()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Failed to read file: {str(exc)}"},
+        )
+    return detect_silence_in_wav(
+        content,
+        min_pause_duration_seconds=min_pause_duration,
+        silence_threshold_db=silence_threshold_db,
+    )
+
+
+class EvaluationRequest(BaseModel):
+    reference_transcript: str = Field(..., description="Manually verified reference transcript")
+    assemblyai_transcript: str = Field(..., description="Raw verbatim AssemblyAI transcript")
+    audio_duration_seconds: float = Field(..., description="Audio duration in seconds")
+    response_interval_seconds: Optional[float] = Field(None, description="Learner response interval T in seconds")
+    detected_pauses: Optional[list] = Field(default_factory=list, description="Detected silence pause events")
+    reference_pause_events: Optional[list] = Field(default_factory=list, description="Annotated reference pause events")
+    reference_repetition_events: Optional[list] = Field(default_factory=list, description="Annotated reference repetitions")
+    reference_self_correction_events: Optional[list] = Field(default_factory=list, description="Annotated reference self-corrections")
+    reference_speech_rate_wpm: Optional[float] = Field(None, description="Reference speech rate WPM")
+    reference_response_duration_seconds: Optional[float] = Field(None, description="Reference response duration")
+    min_pause_duration_seconds: Optional[float] = Field(0.25, description="Minimum qualifying pause threshold")
+    silence_threshold_db: Optional[float] = Field(-35.0, description="Silence energy threshold dBFS")
+    normalize: Optional[bool] = Field(True, description="Apply standard normalization policy")
+
+
+@app.post("/evaluate", summary="Run Articula thesis evaluation formulas")
+def evaluate_endpoint(req: EvaluationRequest):
+    """
+    Executes formal Articula thesis evaluation calculations:
+    - Word Error Rate (WER) using Wagner-Fischer dynamic programming
+    - Speech Rate: 60 * W / T
+    - Pause Frequency: P / T and Mean Pause Duration
+    - Repetition Rate: 100 * R / W
+    - Candidate Self-Corrections
+    - Quantitative Errors: MAE, Median Absolute Error, Signed Differences
+    - Event-Detection Evaluation: Precision, Recall, F1 for pauses and repetitions
+    """
+    # 1. Word Error Rate (WER) & Alignment
+    alignment = compute_word_alignment(
+        reference_text=req.reference_transcript,
+        hypothesis_text=req.assemblyai_transcript,
+        normalize=req.normalize if req.normalize is not None else True,
+    )
+
+    # 2. Speech Rate (WPM = 60 * W / T)
+    effective_t = (
+        req.response_interval_seconds
+        if (req.response_interval_seconds is not None and req.response_interval_seconds > 0)
+        else req.audio_duration_seconds
+    )
+    speech_rate = compute_speech_rate(
+        word_count=alignment["recognized_word_count"],
+        response_interval_seconds=effective_t,
+    )
+
+    # 3. Pause Metrics (P / T, mean pause duration)
+    pause_metrics = compute_pause_metrics(
+        pause_events=req.detected_pauses or [],
+        eligible_duration_seconds=effective_t,
+    )
+
+    # 4. Repetition Detection & Rate (100 * R / W)
+    hyp_tokens = normalize_transcript(req.assemblyai_transcript)
+    candidate_repetitions = detect_candidate_repetitions(hyp_tokens)
+    rep_count = (
+        len(req.reference_repetition_events)
+        if req.reference_repetition_events
+        else len(candidate_repetitions)
+    )
+    repetition_rate = compute_repetition_rate(
+        repetition_event_count=rep_count,
+        word_count=alignment["recognized_word_count"],
+    )
+
+    # 5. Candidate Self-Corrections
+    candidate_self_corrections = detect_candidate_self_corrections(
+        text=req.assemblyai_transcript,
+        tokens=hyp_tokens,
+    )
+
+    # 6. Quantitative Error Measures (MAE, Median AE, Signed Differences)
+    quantitative_errors = {}
+    if req.reference_speech_rate_wpm is not None and speech_rate["speech_rate_wpm"] is not None:
+        sr_pairs = [(speech_rate["speech_rate_wpm"], req.reference_speech_rate_wpm)]
+        quantitative_errors["speech_rate_wpm"] = compute_quantitative_errors(sr_pairs, unit_label="WPM")
+
+    if req.reference_response_duration_seconds is not None and effective_t > 0:
+        dur_pairs = [(effective_t, req.reference_response_duration_seconds)]
+        quantitative_errors["response_duration_seconds"] = compute_quantitative_errors(dur_pairs, unit_label="seconds")
+
+    # 7. Event-Detection Evaluation (Precision, Recall, F1)
+    event_evaluations = {}
+    if req.reference_pause_events:
+        event_evaluations["pause_detection"] = evaluate_event_detection(
+            detected_events=req.detected_pauses or [],
+            reference_events=req.reference_pause_events,
+            tolerance_seconds=req.min_pause_duration_seconds or 0.25,
+        )
+
+    if req.reference_repetition_events:
+        event_evaluations["repetition_detection"] = evaluate_event_detection(
+            detected_events=candidate_repetitions,
+            reference_events=req.reference_repetition_events,
+            tolerance_seconds=req.min_pause_duration_seconds or 0.25,
+        )
+
+    return {
+        "alignment": alignment,
+        "speech_rate": speech_rate,
+        "pause_metrics": pause_metrics,
+        "repetition_metrics": {
+            "candidate_repetitions": candidate_repetitions,
+            "repetition_rate": repetition_rate,
+        },
+        "self_corrections": {
+            "candidates": candidate_self_corrections,
+            "candidate_count": len(candidate_self_corrections),
+        },
+        "quantitative_errors": quantitative_errors,
+        "event_evaluations": event_evaluations,
+        "reproducibility": {
+            "formulas": {
+                "wer": "WER = (S + D + I) / N",
+                "speech_rate": "Speech Rate (WPM) = 60 * W / T",
+                "pause_frequency": "Pause Frequency = P / T",
+                "mean_pause_duration": "Mean Pause Duration = sum(durations) / P",
+                "repetition_rate": "Repetition Rate (%) = 100 * R / W",
+                "mae": "MAE = sum(|auto - ref|) / n",
+                "precision": "Precision = TP / (TP + FP)",
+                "recall": "Recall = TP / (TP + FN)",
+                "f1": "F1 = 2 * Precision * Recall / (Precision + Recall)",
+            },
+            "parameters": {
+                "min_pause_duration_seconds": req.min_pause_duration_seconds,
+                "silence_threshold_db": req.silence_threshold_db,
+                "normalization_policy": "lowercase=True, remove_punctuation=True, preserve_fillers=True",
+            },
+        },
+    }
+

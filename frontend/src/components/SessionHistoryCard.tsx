@@ -1,11 +1,11 @@
 import React from 'react';
 import { History, Trash2, Eye, CheckCircle2, XCircle, FileAudio, Clock } from 'lucide-react';
-import type { HistoryItem } from '../types';
+import type { TestSessionRecord } from '../types';
 
 interface SessionHistoryCardProps {
-  history: HistoryItem[];
+  history: TestSessionRecord[];
   onClearHistory: () => void;
-  onSelectHistoryItem: (item: HistoryItem) => void;
+  onSelectHistoryItem: (item: TestSessionRecord) => void;
 }
 
 export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
@@ -66,13 +66,13 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
 
           return (
             <div
-              key={item.id}
+              key={`${item.test_case_id}-${idx}`}
               className="p-3 bg-slate-950/60 border border-slate-800/80 rounded-lg hover:border-slate-700 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3"
             >
               <div className="space-y-1 min-w-0 flex-1">
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="text-[11px] font-mono font-semibold px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
-                    Test #{testNumber}
+                    #{testNumber} {item.test_case_id}
                   </span>
                   <span
                     className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border flex items-center gap-1 ${
@@ -88,30 +88,46 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
                     )}
                     {item.status}
                   </span>
+
+                  {item.word_error_rate_percent !== null && (
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-indigo-500/10 border border-indigo-500/20 text-indigo-300">
+                      WER: {item.word_error_rate_percent}%
+                    </span>
+                  )}
+
+                  {item.speech_rate_wpm !== null && (
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-teal-500/10 border border-teal-500/20 text-teal-300">
+                      {item.speech_rate_wpm} WPM
+                    </span>
+                  )}
+
                   <span className="text-[11px] text-slate-400 truncate flex items-center gap-1">
                     <FileAudio className="w-3 h-3 text-slate-500 shrink-0" />
-                    {item.filename}
+                    {item.audio_file}
                   </span>
                 </div>
 
                 {/* Preview text */}
                 <p className="text-xs text-slate-300 font-mono line-clamp-1 italic">
-                  {item.transcriptText
-                    ? `"${item.transcriptText}"`
-                    : item.errorMessage || '[No transcript text]'}
+                  {item.assemblyai_transcript
+                    ? `"${item.assemblyai_transcript}"`
+                    : item.exclusion_reason || '[No transcript text]'}
                 </p>
 
-                <div className="flex items-center gap-3 text-[10px] text-slate-500">
+                <div className="flex flex-wrap items-center gap-3 text-[10px] text-slate-500">
                   <span>{item.timestamp}</span>
-                  {item.processingTimeSec !== undefined && (
+                  {item.audio_duration_seconds !== undefined && (
                     <span className="flex items-center gap-1">
                       <Clock className="w-3 h-3" />
-                      {item.processingTimeSec}s process
+                      {item.audio_duration_seconds}s audio
                     </span>
                   )}
-                  {item.audioDurationSec !== undefined && (
-                    <span>{item.audioDurationSec}s audio</span>
+                  {item.pause_count > 0 && (
+                    <span>
+                      {item.pause_count} pauses ({item.mean_pause_duration_seconds}s avg)
+                    </span>
                   )}
+                  <span className="text-slate-400">Condition: {item.recording_condition}</span>
                 </div>
               </div>
 

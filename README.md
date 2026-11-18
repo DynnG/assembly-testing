@@ -1,233 +1,186 @@
-# Articula: AssemblyAI ASR Testing Web App
+# Articula: AssemblyAI ASR Evaluation Web App
 
-A functional, standalone web application built to evaluate **AssemblyAI's Speech-to-Text (ASR) API** for our thesis project:
-> **Articula: An AI-Based Speech Coach for Clear and Effective English Communication Through Conversational Voice Analysis.**
+A functional research-testing application for evaluating **AssemblyAI Speech-to-Text** as the automatic speech recognition (ASR) component for the thesis:
+> **“Articula: An AI-Based Speech Coach for Clear and Effective English Communication Through Conversational Voice Analysis.”**
 
-This prototype allows researchers and developers to test speech recognition accuracy, assess word-level timestamps and confidence scores, and critically evaluate **speech disfluency preservation** (e.g., filler words like *"um"* and *"uh"*, stuttered repetitions like *"I-I"*, false starts, self-corrections, and unaltered grammatical errors) necessary for downstream speech fluency coaching algorithms.
-
----
-
-## 1. System Architecture & Features
-
-- **Frontend:** React 19 + TypeScript + Vite + Tailwind CSS.
-- **Backend:** Python 3.13 + FastAPI + Uvicorn + HTTPX.
-- **ASR Provider:** AssemblyAI Speech-to-Text API (`v2`).
-- **Privacy & Audio Handling:** Preserves original audio formats; never permanently stores uploaded audio or transcripts on the backend server.
-- **API Key Security:** Key is strictly kept on the backend in `backend/.env` and never exposed to the frontend or browser.
-
-### Key Capabilities
-1. **API Connection & Authentication Status:**
-   - Lightweight, official verification request (`GET /v2/transcript?limit=1`) that authenticates your key without spending quota on unnecessary audio transcription.
-   - Distinguishes missing keys, invalid keys (HTTP 401), rate limits, and network errors.
-2. **Audio Input Options:**
-   - **Upload Audio:** Accepts WAV, MP3, M4A, WebM, OGG, and FLAC (up to 50 MB for testing). Validates file format and displays duration and size preview.
-   - **Record Audio (Optional):** In-browser microphone recorder using native `MediaRecorder` API. Requests permission only when clicked. Real-time timer and playback preview before submission.
-3. **Disfluency Preservation Control (`disfluencies=true`):**
-   - By default, AssemblyAI cleans up verbal pauses and filler words. This prototype provides an explicit toggle (enabled by default) to instruct AssemblyAI to retain raw filler words.
-4. **Verbatim Transcript Display:**
-   - Outputs the exact transcription string returned by AssemblyAI without synthetic cleanup or grammar alterations.
-   - Includes one-click clipboard copy, plain-text (`.txt`) download, duration metrics, word counts, and word-level timestamps/confidence inspectors.
-5. **Dedicated Disfluency & Fluency Experiment Section:**
-   - Pre-configured speaking prompts targeting fillers, repetitions, false starts, and grammatical slips.
-   - Side-by-side comparison between expected spoken utterances and raw ASR output.
-6. **Ephemeral Session History:**
-   - In-memory test run log for comparing multiple test recordings during your browsing session.
+This application provides a rigorous, auditable testing platform to evaluate transcription accuracy against ground truth, measure conversational speech-rate indicators, detect silent pauses using independent acoustic signal analysis, track speech disfluencies (fillers, repetitions, self-corrections), compute quantitative error metrics (MAE, Precision, Recall, F1), and export comprehensive reproducibility records.
 
 ---
 
-## 2. Project Structure
+## 1. System Architecture & Capabilities
 
 ```text
 testing/
-├── frontend/                     # React + Vite + TypeScript web dashboard
+├── backend/                       # Python 3.13 + FastAPI Backend
+│   ├── main.py                    # REST API: /health, /test-connection, /transcribe, /analyze-silence, /evaluate
+│   ├── evaluation.py              # Thesis formulas: WER, Speech Rate, Pause/Repetition rates, MAE, F1
+│   ├── silence_detector.py        # Independent acoustic signal silence detector (RMS & dBFS analysis)
+│   ├── test_evaluation.py         # Automated pytest test suite (23 unit tests)
+│   ├── requirements.txt           # Dependencies (FastAPI, Uvicorn, HTTPX, NumPy, Pytest, python-dotenv)
+│   └── .env.example               # Template for ASSEMBLYAI_API_KEY
+├── frontend/                      # React 19 + TypeScript + Vite + Tailwind CSS
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── Header.tsx                 # Application header & data privacy notice
-│   │   │   ├── ApiStatusCard.tsx          # Backend status & AssemblyAI auth tester
-│   │   │   ├── AudioInputCard.tsx         # File upload & MediaRecorder microphone
-│   │   │   ├── DisfluencyTestCard.tsx     # Prompts, comparison & fluency inspection
-│   │   │   ├── TranscriptionResultsCard.tsx# Raw transcript viewer & metadata
-│   │   │   └── SessionHistoryCard.tsx     # In-memory test run log
+│   │   │   ├── Header.tsx                 # Header & data privacy disclosure
+│   │   │   ├── ResearchLimitationsCard.tsx# Section 9 thesis limitations & guidance
+│   │   │   ├── ApiStatusCard.tsx          # Real-time backend status & AssemblyAI auth tester
+│   │   │   ├── TestCaseSelectorCard.tsx   # 10 authorized thesis scenarios & provenance editor
+│   │   │   ├── AudioInputCard.tsx         # File upload & MediaRecorder microphone recording
+│   │   │   ├── TranscriptionResultsCard.tsx# Raw verbatim transcript viewer & metadata
+│   │   │   ├── ReferenceAndWerCard.tsx    # Ground-truth alignment (S, D, I, N, WER %, normalization policy)
+│   │   │   ├── SpeechMeasurementsCard.tsx # WPM, Pause Frequency, Mean Pause Duration, Repetition Rate
+│   │   │   ├── WordDiagnosticCard.tsx     # Word timestamps, confidence %, and candidate gap inspector
+│   │   │   ├── EvaluationResultsCard.tsx  # MAE, Median AE, Signed Differences, Precision, Recall, F1
+│   │   │   ├── ExportCard.tsx             # TXT, per-test CSV, alignment CSV, reproducibility JSON
+│   │   │   └── SessionHistoryCard.tsx     # Ephemeral in-memory session run log
+│   │   ├── data/
+│   │   │   └── testScenarios.ts           # Library of 10 standard research scenarios
 │   │   ├── services/
-│   │   │   └── api.ts                     # HTTP client communicating with backend
-│   │   ├── types.ts                       # TypeScript interfaces
+│   │   │   ├── api.ts                     # REST client for backend endpoints
+│   │   │   └── audioAnalysis.ts           # In-browser Web Audio API acoustic silence detector
+│   │   ├── types.ts                       # Research schema interfaces
 │   │   ├── App.tsx                        # Main dashboard coordinator
-│   │   ├── index.css                      # Tailwind dark navy styling
 │   │   └── main.tsx                       # React application entry point
 │   ├── package.json
-│   ├── tsconfig.json
-│   └── vite.config.ts                     # Dev server & API proxy config
-├── backend/                      # FastAPI Python backend
-│   ├── main.py                   # REST endpoints (/health, /test-connection, /transcribe)
-│   ├── requirements.txt          # Python dependencies
-│   ├── .env.example              # Template for API credentials
-│   └── venv/                     # Python virtual environment (ignored in git)
-├── .gitignore                    # Git ignore file protecting .env & node_modules
-└── README.md                     # Beginner-friendly setup instructions
+│   └── vite.config.ts                     # Dev server & backend proxy configuration
+├── .gitignore                             # Protects .env, venv/, node_modules/, dist/
+└── README.md                              # This specification and setup guide
 ```
 
 ---
 
-## 3. Prerequisites
+## 2. Thesis Formulas & Measurement Methods
 
-Ensure you have the following installed on your Windows machine:
-- **Python 3.10+** (Python 3.13 tested): Verify with `python --version`
-- **Node.js v18+** (Node.js v24 tested): Verify with `node --version`
-- **npm v9+**: Verify with `npm --version`
-- **Windows PowerShell**
+### A. Word Error Rate (WER)
+Calculated using the standard Wagner-Fischer dynamic programming word alignment:
+
+$$\text{WER} = \frac{S + D + I}{N}$$
+$$\text{WER}_{\%} = 100 \times \frac{S + D + I}{N}$$
+
+- $S$ = Substitutions (mismatched words)
+- $D$ = Deletions (words in reference omitted by ASR)
+- $I$ = Insertions (extra words recognized by ASR not in reference)
+- $N$ = Number of words in manually verified reference transcript
+- **Empty Reference Handling:** If $N = 0$, WER is explicitly marked as `undefined` (never 0 or crashing).
+- **Filler Retention:** Fillers (*"um"*, *"uh"*, *"erm"*) are retained as distinct tokens during alignment; dropped fillers correctly register as deletions ($D$).
+- **Normalization Policy:** Both raw verbatim and normalized versions are retained. Case is lowercased and punctuation stripped. Contractions and hyphenated stutters (*"I-I"*) are preserved.
+- **Thesis Advisory:** Lower WER indicates greater verbatim word-level alignment with the reference transcript. It does **not** establish pronunciation quality or overall speaking proficiency.
+
+### B. Speech Rate (WPM)
+Calculated according to the thesis formula:
+
+$$\text{Speech Rate (WPM)} = \frac{60 \times W}{T}$$
+
+- $W$ = Recognized spoken-word count
+- $T$ = Learner response interval in seconds (including internal silent pauses; excluding system prompts and unused margins)
+- **Zero/Insufficient Speech Handling:** If $T \le 0$ or $W \le 0$, the metric is reported as `unavailable` rather than 0 WPM.
+
+### C. Silence Pause Frequency and Duration
+Implemented via **independent acoustic audio signal analysis** (not inferred solely from word timestamps):
+- Signal is windowed into frames (20 ms window, 10 ms hop).
+- RMS amplitude is converted to $\text{dBFS} = 20 \log_{10}(\text{RMS} / \text{MAX})$.
+- Continuous segments where $\text{dBFS} < \text{threshold}$ (default: $-35.0\text{ dBFS}$) for at least $\text{min\_pause\_duration}$ (default: $0.25\text{ s}$ / $250\text{ ms}$, configurable) are classified as qualifying pause events ($P$).
+- **Pause Frequency:** $\text{Pause Frequency} = P / T$ (pauses per second)
+- **Pauses per Minute:** $\text{Pauses per Minute} = 60 \times P / T$
+- **Mean Pause Duration:** $\text{Mean Pause Duration} = \frac{\sum \text{qualifying pause durations}}{P}$
+- **Zero Pauses Handling:** If $P = 0$, mean pause duration is explicitly reported as `undefined` (None).
+
+### D. Repetition Rate
+Operational implementation-defined metric:
+
+$$\text{Repetition Rate (\%)} = 100 \times \frac{R}{W}$$
+
+- $R$ = Number of annotated / candidate repetition events (stutters like *"I-I"*, single-word duplicates like *"the the"*, or phrase repetitions)
+- $W$ = Eligible spoken-word count
+
+### E. Candidate Self-Corrections
+Identifies verbal repair indicators (e.g., *"actually"*, *"I mean"*, *"rather"*, *"sorry"*, mid-sentence restarts like *"I work—worked"*). Stored as provisional candidates with reviewer decisions (`pending`, `approved`, `rejected`) and reported separately from repetitions.
+
+### F. Quantitative Error Measures (MAE, Median AE, Signed Differences)
+For paired automatic ($A_i$) and reference ($R_i$) measurements (e.g., Speech Rate WPM, Response Duration):
+- **Signed Difference:** $A_i - R_i$
+- **Mean Absolute Error (MAE):** $\text{MAE} = \frac{1}{n} \sum |A_i - R_i|$
+- **Median Absolute Error:** $\text{Median}(|A_i - R_i|)$
+
+### G. Event-Detection Evaluation (Precision, Recall, F1)
+Evaluates silence pause and repetition detection against reference annotations using 1-to-1 temporal matching within a configurable tolerance window ($\pm 0.25\text{ s}$):
+- $\text{Precision} = \frac{\text{TP}}{\text{TP} + \text{FP}}$
+- $\text{Recall} = \frac{\text{TP}}{\text{TP} + \text{FN}}$
+- $\text{F1} = \frac{2 \times \text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}$
+- If denominators are zero, metrics are reported as `undefined` with reasons.
 
 ---
 
-## 4. Setup Instructions (Step-by-Step for Windows)
+## 3. Ten Standard Research Test Scenarios
 
-### Step 1: Obtain an AssemblyAI API Key
-1. Go to the official AssemblyAI website: [https://www.assemblyai.com](https://www.assemblyai.com)
-2. Sign up or log into your account dashboard: [https://www.assemblyai.com/app](https://www.assemblyai.com/app)
-3. Copy your API key from the dashboard home page.
+The test case manager pre-loads 10 authorized research scenarios defined in the thesis:
 
-### Step 2: Configure the Backend Environment
-1. In the `backend` folder, create a file named `.env` by copying `backend/.env.example`.
-2. In PowerShell, you can run:
-   ```powershell
-   Copy-Item backend\.env.example backend\.env
-   ```
-3. Open `backend\.env` in any text editor (Notepad, VS Code) and paste your key:
-   ```env
-   ASSEMBLYAI_API_KEY=your_actual_api_key_here
-   ```
-   *(Note: Never commit `.env` to version control. It is already excluded in `.gitignore`.)*
+1. **TC-01:** Clear speech in a quiet environment (*Baseline read-aloud task*)
+2. **TC-02:** Speech containing filler words (*"uh"*, *"um"*, *"well"*)
+3. **TC-03:** Stuttered and repeated words (*"I-I"*, *"the, the"*)
+4. **TC-04:** Mid-sentence self-corrections and false starts (*"I work—worked in a team"*)
+5. **TC-05:** Longer conversational responses (*Multi-sentence discourse*)
+6. **TC-06:** Different speaking rates (*Rapid articulation > 170 WPM*)
+7. **TC-07:** Speech with background acoustic noise (*Coffee shop ambient speech*)
+8. **TC-08:** Device variation (*Handheld smartphone vs built-in mic*)
+9. **TC-09:** Accent and pronunciation variation (*Filipino English L2 speaker*)
+10. **TC-10:** Short responses and incomplete recordings (*Boundary test, N=3 words*)
 
-### Step 3: Setup the Python Virtual Environment
-Open **Terminal 1** (PowerShell) in the project root directory (`testing`):
+Researchers can select any preset scenario, edit reference transcripts and metadata, or add custom test cases.
 
+---
+
+## 4. Setup and Execution Instructions (Windows PowerShell)
+
+### Step 1: Configure Backend Environment
+Ensure `backend/.env` contains your AssemblyAI API key:
 ```powershell
-# 1. Create virtual environment (if not already created)
-python -m venv backend\venv
-
-# 2. Activate virtual environment
-.\backend\venv\Scripts\Activate.ps1
-
-# Note: If PowerShell reports an execution policy error, run:
-# Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# 3. Install Python dependencies
-pip install -r backend\requirements.txt
+# Copy template if .env does not exist yet
+Copy-Item backend\.env.example backend\.env
+```
+Open `backend/.env` and insert your key:
+```env
+ASSEMBLYAI_API_KEY=your_actual_api_key_here
 ```
 
-### Step 4: Install Frontend Dependencies
-Open **Terminal 2** (PowerShell) in the project root directory:
-
+### Step 2: Run Automated Backend Unit Tests
+To verify all formulas (WER, WPM, pauses, silence detection, MAE, F1):
 ```powershell
-# Navigate into the frontend folder
-cd frontend
-
-# Install Node modules
-npm install
+.\backend\venv\Scripts\pytest.exe -v backend\test_evaluation.py
 ```
+*(All 23 tests should pass).*
 
----
-
-## 5. Running the Application
-
-You will run the backend and frontend in two separate terminals.
-
-### Terminal 1: Start the FastAPI Backend
-From the project root directory:
-
+### Step 3: Start the Backend Server (Terminal 1)
 ```powershell
 .\backend\venv\Scripts\uvicorn.exe main:app --app-dir backend --port 8000 --reload
 ```
 
-You should see:
-```text
-INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     Application startup complete.
-```
-
-### Terminal 2: Start the Vite React Frontend
-From the `frontend` directory:
-
+### Step 4: Start the Frontend Web App (Terminal 2)
 ```powershell
 cd frontend
 npm run dev
 ```
 
-You should see:
-```text
-  VITE ready in ... ms
-  ➜  Local:   http://127.0.0.1:5173/
-```
-
-### Step 5: Open the Application in your Browser
-Open your browser and navigate to:
-👉 **[http://127.0.0.1:5173/](http://127.0.0.1:5173/)** (or `http://localhost:5173/`)
+### Step 5: Open Browser
+Navigate to **[http://127.0.0.1:5173/](http://127.0.0.1:5173/)**.
 
 ---
 
-## 6. How to Test the Application
+## 5. Research Scope and Limitations (Section 9)
 
-### A. Test API Connection
-1. In the top card **API Connection & Status**, verify that:
-   - **FastAPI Backend** shows **Connected** (green).
-   - **AssemblyAI Configuration** shows **Configured** (green).
-2. Click **Test API Connection**.
-3. The backend sends a minimal authenticated check to `GET https://api.assemblyai.com/v2/transcript?limit=1`.
-4. A green alert box will confirm: *"Successfully authenticated with AssemblyAI API."*
-   *(If your key is invalid, it will display a clear 401 Unauthorized explanation without crashing.)*
-
-### B. Transcribe an Uploaded Audio File
-1. Under **Audio Input**, ensure the **Upload File** tab is active.
-2. Drag and drop any `.wav`, `.mp3`, `.m4a`, or `.webm` file, or click to browse.
-3. Review the file name, detected duration, and file size. Play the audio preview to verify quality.
-4. Ensure **Preserve Speech Disfluencies (`disfluencies=true`)** is toggled ON.
-5. Click **Transcribe Audio**.
-6. The app displays real-time processing elapsed seconds while streaming to AssemblyAI and polling for results.
-7. Once complete, inspect the verbatim transcript, word count, confidence score, and optional word-level timestamp breakdown.
-
-### C. Transcribe Microphone Audio (Optional)
-1. Under **Audio Input**, click the **Record Mic (Optional)** tab.
-2. Click **Start Recording** (your browser will request microphone permission).
-3. Speak a test sentence aloud.
-4. Click **Stop Recording**.
-5. Listen to the audio preview using the player.
-6. Click **Transcribe Audio** to process your recording.
-
-### D. Systematic Speech Disfluency Experiment (For Articula Thesis)
-The core research question for Articula is whether AssemblyAI accurately preserves speech hesitations needed to compute speaker fluency scores.
-
-Use the **Articula Disfluency & Fluency Experiment** section:
-1. Select one of the pre-configured prompt cards:
-   - **Prompt 1 (Filler):** *"Um, I think I can do this task."*
-   - **Prompt 2 (Stuttered Repetition):** *"I-I want to explain my idea."*
-   - **Prompt 3 (Word Repetition):** *"The, the main reason is communication."*
-   - **Prompt 4 (Self-Correction):** *"I wanted to go—actually, I stayed home."*
-   - **Prompt 5 (Grammar Error):** *"Yesterday I go to school and meet my friend."*
-2. Or click **Add Custom Prompt** to define your own test utterance.
-3. Read the prompt displayed in the teleprompter into the microphone and record.
-4. Transcribe the recording.
-5. Review the **Transcript Disfluency Inspection** panel:
-   - Compares expected phrase with raw transcript.
-   - Highlights whether fillers or repetitions were preserved or filtered out.
-   - Notes potential impacts on Articula's downstream speech coaching metrics (hesitation index, speech rate).
+In adherence to the Articula thesis specification:
+- **WER $\ne$ Pronunciation:** High transcription accuracy indicates agreement with words spoken, not native-like phonological pronunciation.
+- **Provider Confidence $\ne$ Learner Fluency:** AssemblyAI confidence represents acoustic decoding confidence, not speaker proficiency or confidence.
+- **Acoustic Silence $\ne$ Timestamp Gaps:** Gaps between word timestamps in ASR output are only candidate pauses. Silence is verified against the acoustic audio signal.
+- **No Standardized Proficiency Scores:** Articula does not assign CEFR levels, IELTS bands, or infer emotional states or anxiety. It is designed as an experimental formative practice prototype.
 
 ---
 
-## 7. Troubleshooting
+## 6. Export Capabilities
 
-| Issue | Likely Cause | Solution |
-| :--- | :--- | :--- |
-| **Backend Disconnected** | FastAPI server is not running or running on wrong port. | Start the backend using `.\backend\venv\Scripts\uvicorn.exe main:app --app-dir backend --port 8000 --reload` in Terminal 1. |
-| **Missing API Key** | `backend/.env` does not exist or has placeholder text. | Create `backend/.env` and set `ASSEMBLYAI_API_KEY=your_actual_key`. The backend automatically reloads `.env` changes. |
-| **401 Unauthorized Error** | AssemblyAI key was mistyped or revoked. | Copy a fresh API key from [AssemblyAI Dashboard](https://www.assemblyai.com/app). |
-| **Microphone Permission Denied** | Browser blocked mic access or no mic detected. | Click the lock/tune icon in the browser address bar, set Microphone to **Allow**, and reload the page. Note that file upload works independently without a microphone. |
-| **CORS Error** | Direct backend access without Vite proxy. | Access the app via `http://127.0.0.1:5173`. The backend is preconfigured to permit CORS origins for localhost ports 5173 and 3000. |
-| **Unsupported Audio Format** | File is not a supported audio container. | Use standard formats: WAV, MP3, M4A, WebM, OGG, or FLAC. |
-
----
-
-## 8. API Pricing & Free Tier Limits
-
-- **Free Tier:** AssemblyAI provides free credits upon account registration to test their Speech-to-Text API.
-- **Speech-to-Text Rates:** Audio transcription is billed by processed audio duration (typically ~$0.15 to ~$0.37 per audio hour depending on the model tier).
-- **Official Documentation:** [https://www.assemblyai.com/docs/](https://www.assemblyai.com/docs/)
-- **Pricing Information:** [https://www.assemblyai.com/pricing](https://www.assemblyai.com/pricing)
+Under **Research Data & Reproducibility Export**, researchers can download:
+1. **Raw Transcript TXT:** Verbatim AssemblyAI text.
+2. **Per-Test CSV:** Complete row containing all 30+ recording, reference, AssemblyAI, and evaluation variables.
+3. **Token Alignment CSV:** Reference vs recognized word tokens with S, D, I classifications.
+4. **Reproducibility Record JSON:** Provenance audit document containing formulas, thresholds used, normalization policy, software environment, and inputs.
+5. **Session Summary CSV:** Aggregate table across all tests run during the browsing session.

@@ -1,4 +1,10 @@
-import type { HealthResponse, TestConnectionResponse, TranscriptionResponse } from '../types';
+import type {
+  EvaluationResponse,
+  HealthResponse,
+  SilenceAnalysisResult,
+  TestConnectionResponse,
+  TranscriptionResponse,
+} from '../types';
 
 // Use proxy path /api which proxies to http://127.0.0.1:8000
 const API_BASE = '/api';
@@ -82,4 +88,67 @@ export async function transcribeAudio(
   }
 
   return data as TranscriptionResponse;
+}
+
+/**
+ * Run formal Articula thesis evaluation calculations (WER, speech rate, pause metrics, errors).
+ */
+export async function evaluateMetrics(payload: {
+  reference_transcript: string;
+  assemblyai_transcript: string;
+  audio_duration_seconds: number;
+  response_interval_seconds?: number;
+  detected_pauses?: any[];
+  reference_pause_events?: any[];
+  reference_repetition_events?: any[];
+  reference_self_correction_events?: any[];
+  reference_speech_rate_wpm?: number;
+  reference_response_duration_seconds?: number;
+  min_pause_duration_seconds?: number;
+  silence_threshold_db?: number;
+  normalize?: boolean;
+}): Promise<EvaluationResponse> {
+  const res = await fetch(`${API_BASE}/evaluate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    const detail = data.detail || {};
+    const message = detail.message || data.message || `Evaluation failed with HTTP ${res.status}`;
+    throw new Error(message);
+  }
+
+  return data as EvaluationResponse;
+}
+
+/**
+ * Request backend silence analysis on audio file (WAV).
+ */
+export async function analyzeSilenceBackend(
+  file: File | Blob,
+  minPauseDuration: number = 0.25,
+  silenceThresholdDb: number = -35.0
+): Promise<SilenceAnalysisResult> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('min_pause_duration', String(minPauseDuration));
+  formData.append('silence_threshold_db', String(silenceThresholdDb));
+
+  const res = await fetch(`${API_BASE}/analyze-silence`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Silence analysis failed with HTTP ${res.status}`);
+  }
+
+  return data as SilenceAnalysisResult;
 }
