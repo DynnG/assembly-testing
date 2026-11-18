@@ -256,6 +256,25 @@ async def transcribe_audio(
             },
         )
 
+    # Acoustic silence analysis on WAV signal
+    silence_result = None
+    if filename.lower().endswith(".wav"):
+        silence_result = detect_silence_in_wav(
+            audio_content,
+            min_pause_duration_seconds=0.25,
+            silence_threshold_db=-35.0,
+        )
+    else:
+        silence_result = {
+            "detected_pauses": [],
+            "pause_count": 0,
+            "total_pause_duration_seconds": 0.0,
+            "mean_pause_duration_seconds": None,
+            "audio_duration_seconds": None,
+            "status": "unavailable",
+            "reason": "Backend signal analysis is optimized for uncompressed PCM WAV. Browser Web Audio API analyzes silence for compressed formats (WebM/MP3/M4A).",
+        }
+
     headers = {
         "Authorization": api_key,
     }
@@ -400,24 +419,6 @@ async def transcribe_audio(
                 "message": f"Unexpected error during transcription: {str(exc)}",
             },
         )
-        # Run silence detector on audio bytes if WAV format
-        silence_result = None
-        if filename.lower().endswith(".wav"):
-            silence_result = detect_silence_in_wav(
-                audio_content,
-                min_pause_duration_seconds=0.25,
-                silence_threshold_db=-35.0,
-            )
-        else:
-            silence_result = {
-                "detected_pauses": [],
-                "pause_count": 0,
-                "total_pause_duration_seconds": 0.0,
-                "mean_pause_duration_seconds": None,
-                "audio_duration_seconds": None,
-                "status": "unavailable",
-                "reason": "Backend signal analysis is optimized for uncompressed PCM WAV. Browser Web Audio API analyzes silence for compressed formats (WebM/MP3/M4A).",
-            }
     finally:
         # Explicitly release memory reference to uploaded audio bytes
         del audio_content

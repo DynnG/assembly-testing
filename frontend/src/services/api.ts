@@ -10,6 +10,38 @@ import type {
 const API_BASE = '/api';
 
 /**
+ * Safely parse HTTP response handling both JSON and plain-text/HTML errors.
+ */
+async function parseResponse<T>(res: Response, defaultErrorMsg: string): Promise<T> {
+  const text = await res.text();
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok) {
+    if (data && data.detail) {
+      const msg = typeof data.detail === 'string'
+        ? data.detail
+        : data.detail.message || JSON.stringify(data.detail);
+      throw new Error(msg);
+    }
+    if (data && data.message) {
+      throw new Error(data.message);
+    }
+    throw new Error(text || `${defaultErrorMsg} (HTTP ${res.status})`);
+  }
+
+  if (data === null) {
+    throw new Error(`${defaultErrorMsg}: Server returned empty or non-JSON response.`);
+  }
+
+  return data as T;
+}
+
+/**
  * Fetch backend health status and whether the AssemblyAI API key is configured.
  */
 export async function getHealth(): Promise<HealthResponse> {
@@ -18,10 +50,7 @@ export async function getHealth(): Promise<HealthResponse> {
       method: 'GET',
       headers: { Accept: 'application/json' },
     });
-    if (!res.ok) {
-      throw new Error(`Backend returned HTTP ${res.status}`);
-    }
-    return await res.json();
+    return await parseResponse<HealthResponse>(res, 'Failed to fetch backend health');
   } catch (err: any) {
     throw new Error(err.message || 'Failed to connect to backend server');
   }
@@ -37,10 +66,19 @@ export async function testConnection(): Promise<TestConnectionResponse> {
       headers: { Accept: 'application/json' },
     });
 
-    const data = await res.json();
+    const text = await res.text();
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
     if (!res.ok) {
-      const detail = data.detail || {};
-      const message = detail.message || data.message || `Request failed with HTTP ${res.status}`;
+      const detail = data?.detail || {};
+      const message = typeof detail === 'string'
+        ? detail
+        : detail.message || data?.message || text || `Request failed with HTTP ${res.status}`;
       return {
         success: false,
         message,
@@ -51,7 +89,7 @@ export async function testConnection(): Promise<TestConnectionResponse> {
 
     return {
       success: true,
-      message: data.message || 'Connected successfully to AssemblyAI API',
+      message: data?.message || 'Connected successfully to AssemblyAI API',
       status_code: 200,
     };
   } catch (err: any) {
@@ -80,14 +118,7 @@ export async function transcribeAudio(
     body: formData,
   });
 
-  const data = await res.json();
-  if (!res.ok) {
-    const detail = data.detail || {};
-    const message = detail.message || data.message || `Transcription failed with HTTP ${res.status}`;
-    throw new Error(message);
-  }
-
-  return data as TranscriptionResponse;
+  return await parseResponse<TranscriptionResponse>(res, 'Transcription request failed');
 }
 
 /**
@@ -117,14 +148,7 @@ export async function evaluateMetrics(payload: {
     body: JSON.stringify(payload),
   });
 
-  const data = await res.json();
-  if (!res.ok) {
-    const detail = data.detail || {};
-    const message = detail.message || data.message || `Evaluation failed with HTTP ${res.status}`;
-    throw new Error(message);
-  }
-
-  return data as EvaluationResponse;
+  return await parseResponse<EvaluationResponse>(res, 'Evaluation calculation failed');
 }
 
 /**
@@ -145,10 +169,5 @@ export async function analyzeSilenceBackend(
     body: formData,
   });
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Silence analysis failed with HTTP ${res.status}`);
-  }
-
-  return data as SilenceAnalysisResult;
+  return await parseResponse<SilenceAnalysisResult>(res, 'Silence analysis failed');
 }
