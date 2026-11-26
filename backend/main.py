@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
@@ -22,6 +22,15 @@ from evaluation import (
     normalize_transcript,
 )
 from silence_detector import detect_silence_in_wav
+from phoneme_analyzer import analyze_words_phonemes, CANONICAL_IPA_REFERENCE
+from phoneme_comparison import (
+    ExpectedPhonemeGenerator,
+    compare_word_phonemes,
+    tokenize_phoneme_sequence,
+)
+
+# Reference pronunciation generator singleton for API endpoints
+_MAIN_EXPECTED_GENERATOR = ExpectedPhonemeGenerator(canonical_overrides=CANONICAL_IPA_REFERENCE)
 
 # Load environment variables from backend/.env or root .env
 env_path = Path(__file__).parent / ".env"
@@ -190,6 +199,7 @@ async def test_connection():
 async def transcribe_audio(
     file: UploadFile = File(...),
     disfluencies: bool = Form(True),
+    phoneme_analysis: bool = Form(True),
 ):
     """
     Accepts an audio file, streams it directly to AssemblyAI's upload endpoint,
@@ -419,9 +429,6 @@ async def transcribe_audio(
                 "message": f"Unexpected error during transcription: {str(exc)}",
             },
         )
-    finally:
-        # Explicitly release memory reference to uploaded audio bytes
-        del audio_content
 
     elapsed_time = round(time.time() - start_time, 2)
 
@@ -430,29 +437,79 @@ async def transcribe_audio(
     cleaned_words = [
         {
             "text": w.get("text"),
+            "word": w.get("text"),
             "start": w.get("start"),
             "end": w.get("end"),
             "confidence": w.get("confidence"),
+            "assembly_confidence": w.get("confidence"),
             "speaker": w.get("speaker"),
         }
         for w in words
         if isinstance(w, dict)
     ]
 
+    phoneme_meta = {
+        "enabled": phoneme_analysis,
+        "model": "facebook/wav2vec2-lv-60-espeak-cv-ft",
+        "status": "skipped" if not phoneme_analysis else "pending",
+        "notes": None,
+    }
+
+    transcript_id = completed_data.get("id") or f"transcript_{int(time.time())}"
+    full_text = completed_data.get("text", "")
+    audio_meta_info = {
+        "duration": completed_data.get("audio_duration"),
+        "sample_rate": 16000,
+        "channels": 1,
+    }
+
+    # Integrate Hugging Face Wav2Vec2Phoneme for pronunciation characteristic analysis
+    if phoneme_analysis and cleaned_words:
+        try:
+            hybrid_result = analyze_words_phonemes(
+                audio_bytes=audio_content,
+                words=cleaned_words,
+                filename=filename,
+                padding_ms=25,
+                recording_id=transcript_id,
+                full_transcription=full_text,
+                return_unified=True,
+            )
+            cleaned_words = hybrid_result.get("words", cleaned_words)
+            if hybrid_result.get("audio_metadata"):
+                audio_meta_info = hybrid_result["audio_metadata"]
+            phoneme_meta["status"] = "completed"
+            phoneme_meta["analyzed_tokens"] = len(cleaned_words)
+        except Exception as pe:
+            # Preserve AssemblyAI transcription if phoneme analysis encounters an error
+            phoneme_meta["status"] = "error"
+            phoneme_meta["notes"] = f"Phoneme analysis warning: {str(pe)}"
+    elif not phoneme_analysis:
+        phoneme_meta["status"] = "disabled"
+
+    # Explicitly release memory reference to uploaded audio bytes
+    del audio_content
+
     return {
         "success": True,
-        "id": completed_data.get("id"),
+        "id": transcript_id,
+        "recording_id": transcript_id,
         "status": completed_data.get("status"),
-        "text": completed_data.get("text", ""),
+        "text": full_text,
+        "full_transcription": full_text,
         "confidence": completed_data.get("confidence"),
         "audio_duration": completed_data.get("audio_duration"),
+        "audio_metadata": audio_meta_info,
         "words": cleaned_words,
         "disfluencies_enabled": disfluencies,
+        "phoneme_analysis": phoneme_meta,
+        "pronunciation_summary": hybrid_result.get("pronunciation_summary") if (phoneme_analysis and "hybrid_result" in locals() and isinstance(hybrid_result, dict)) else None,
+        "pronunciation_findings": hybrid_result.get("pronunciation_findings") if (phoneme_analysis and "hybrid_result" in locals() and isinstance(hybrid_result, dict)) else [],
         "processing_time_sec": elapsed_time,
         "filename": filename,
         "silence_analysis": silence_result,
         "raw_metadata": {
-            "id": completed_data.get("id"),
+            "id": transcript_id,
             "status": completed_data.get("status"),
             "audio_duration": completed_data.get("audio_duration"),
             "confidence": completed_data.get("confidence"),
@@ -462,6 +519,99 @@ async def transcribe_audio(
             "punctuate": completed_data.get("punctuate"),
             "format_text": completed_data.get("format_text"),
         },
+    }
+
+
+@app.post("/analyze-phonemes", summary="Run standalone Wav2Vec2Phoneme analysis on audio with word timestamps")
+async def analyze_phonemes_endpoint(
+    file: UploadFile = File(...),
+    words_json: str = Form(..., description="JSON serialized array of word objects with text, start, end, confidence"),
+    padding_ms: int = Form(25),
+):
+    """
+    Accepts an audio file and word timestamp list, performs audio segmentation,
+    and returns phonetic predictions from Hugging Face Wav2Vec2Phoneme.
+    """
+    import json
+
+    try:
+        content = await file.read()
+        words_data = json.loads(words_json)
+        if not isinstance(words_data, list):
+            raise ValueError("words_json must be a JSON array of word objects")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Invalid input: {str(exc)}"},
+        )
+
+    rec_id = f"recording_{int(time.time())}"
+    full_trans = " ".join(str(w.get("text", "")) for w in words_data)
+    unified = analyze_words_phonemes(
+        audio_bytes=content,
+        words=words_data,
+        filename=file.filename or "audio.wav",
+        padding_ms=padding_ms,
+        recording_id=rec_id,
+        full_transcription=full_trans,
+        return_unified=True,
+    )
+    return {
+        "success": True,
+        "model": "facebook/wav2vec2-lv-60-espeak-cv-ft",
+        **unified,
+    }
+
+
+class ComparePhonemesRequest(BaseModel):
+    word: str = Field(..., description="Target or expected word (e.g. 'think')")
+    predicted_phonemes: Optional[Union[str, list]] = Field(
+        None,
+        description="Predicted phonetic transcription from Wav2Vec2Phoneme (space-separated IPA string or token list, e.g. 't ɪ ŋ k')",
+    )
+    expected_phonemes: Optional[Union[str, list]] = Field(
+        None,
+        description="Optional manual reference phoneme override (space-separated IPA or token list)",
+    )
+    preferred_accent: Optional[str] = Field("General English", description="Reference accent variety (e.g. General English, US, UK)")
+    assembly_confidence: Optional[float] = Field(None, description="Optional ASR word confidence score")
+    audio_clip: Optional[str] = Field(None, description="Optional supporting audio clip filename")
+
+
+@app.post("/compare-phonemes", summary="Compare expected reference phonemes vs predicted phonemes for a word")
+def compare_phonemes_endpoint(req: ComparePhonemesRequest):
+    """
+    Executes sequence alignment and evidence-based pronunciation comparison between:
+    - Expected reference phonemes (from CMUDict, canonical dictionary, or G2P)
+    - Predicted phonemes (from Hugging Face Wav2Vec2Phoneme acoustic model)
+    
+    Returns tokenized expected and predicted phonemes, Levenshtein sequence alignment,
+    Phoneme Error Rate (PER), and evidence-based pronunciation findings.
+    """
+    pred_tokens = []
+    if req.predicted_phonemes:
+        pred_tokens = tokenize_phoneme_sequence(req.predicted_phonemes)
+
+    # If manual expected override is provided, register temporary generator override
+    if req.expected_phonemes:
+        exp_tokens = tokenize_phoneme_sequence(req.expected_phonemes)
+        custom_gen = ExpectedPhonemeGenerator(canonical_overrides={req.word.lower().strip(): " ".join(exp_tokens)})
+        generator_to_use = custom_gen
+    else:
+        generator_to_use = _MAIN_EXPECTED_GENERATOR
+
+    comparison = compare_word_phonemes(
+        word=req.word,
+        predicted_tokens=pred_tokens,
+        generator=generator_to_use,
+        assembly_confidence=req.assembly_confidence,
+        audio_clip=req.audio_clip,
+        preferred_accent=req.preferred_accent or "General English",
+    )
+
+    return {
+        "success": True,
+        **comparison,
     }
 
 

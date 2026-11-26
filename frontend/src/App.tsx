@@ -572,6 +572,8 @@ export const App: React.FC = () => {
         {currentResult?.words && currentResult.words.length > 0 && (
           <WordDiagnosticCard
             words={currentResult.words}
+            fullTranscription={currentResult.full_transcription || currentResult.text}
+            audioMetadata={currentResult.audio_metadata}
             minPauseThresholdSeconds={minPauseDuration}
           />
         )}

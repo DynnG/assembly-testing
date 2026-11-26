@@ -107,11 +107,13 @@ export async function testConnection(): Promise<TestConnectionResponse> {
 export async function transcribeAudio(
   audioFile: File | Blob,
   fileName: string,
-  disfluencies: boolean = true
+  disfluencies: boolean = true,
+  phonemeAnalysis: boolean = true
 ): Promise<TranscriptionResponse> {
   const formData = new FormData();
   formData.append('file', audioFile, fileName);
   formData.append('disfluencies', String(disfluencies));
+  formData.append('phoneme_analysis', String(phonemeAnalysis));
 
   const res = await fetch(`${API_BASE}/transcribe`, {
     method: 'POST',

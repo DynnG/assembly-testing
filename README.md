@@ -12,11 +12,17 @@ This application provides a rigorous, auditable testing platform to evaluate tra
 ```text
 testing/
 ├── backend/                       # Python 3.13 + FastAPI Backend
-│   ├── main.py                    # REST API: /health, /test-connection, /transcribe, /analyze-silence, /evaluate
+│   ├── main.py                    # REST API: /health, /test-connection, /transcribe, /analyze-silence, /evaluate, /analyze-phonemes, /compare-phonemes
+│   ├── phoneme_analyzer.py        # Hugging Face Wav2Vec2Phoneme pronunciation characteristic analyzer & word segmenter
+│   ├── phoneme_comparison.py      # Expected vs Predicted phoneme comparison engine (G2P, CMUDict, alignment, PER, findings)
 │   ├── evaluation.py              # Thesis formulas: WER, Speech Rate, Pause/Repetition rates, MAE, F1
 │   ├── silence_detector.py        # Independent acoustic signal silence detector (RMS & dBFS analysis)
-│   ├── test_evaluation.py         # Automated pytest test suite (23 unit tests)
-│   ├── requirements.txt           # Dependencies (FastAPI, Uvicorn, HTTPX, NumPy, Pytest, python-dotenv)
+│   ├── test_evaluation.py         # Automated pytest test suite for thesis evaluation formulas (23 tests)
+│   ├── test_phoneme_analyzer.py   # Automated pytest test suite for word segmentation & phoneme analysis (13 tests)
+│   ├── test_phoneme_comparison.py # Automated pytest test suite for expected vs predicted phoneme comparison (16 tests)
+│   ├── test_speech_short.wav      # Sample 4.0s 44.1 kHz speech recording for integration testing
+│   ├── sample_hybrid_result.json  # Reference full hybrid transcription + phoneme comparison JSON payload
+│   ├── requirements.txt           # Dependencies (FastAPI, PyTorch, Transformers, SoundFile, Scipy, PyAV, cmudict, g2p_en, etc.)
 │   └── .env.example               # Template for ASSEMBLYAI_API_KEY
 ├── frontend/                      # React 19 + TypeScript + Vite + Tailwind CSS
 │   ├── src/
@@ -144,11 +150,11 @@ ASSEMBLYAI_API_KEY=your_actual_api_key_here
 ```
 
 ### Step 2: Run Automated Backend Unit Tests
-To verify all formulas (WER, WPM, pauses, silence detection, MAE, F1):
+To verify all formulas (WER, WPM, pauses, silence detection, MAE, F1, and phoneme comparison):
 ```powershell
-.\backend\venv\Scripts\pytest.exe -v backend\test_evaluation.py
+.\backend\venv\Scripts\pytest.exe -v backend
 ```
-*(All 23 tests should pass).*
+*(All 52 tests should pass: 23 evaluation + 13 phoneme analyzer + 16 phoneme comparison tests).*
 
 ### Step 3: Start the Backend Server (Terminal 1)
 ```powershell
@@ -166,12 +172,88 @@ Navigate to **[http://127.0.0.1:5173/](http://127.0.0.1:5173/)**.
 
 ---
 
-## 5. Research Scope and Limitations (Section 9)
+## 5. Expected vs. Predicted Phoneme Comparison Architecture
+
+The hybrid pipeline extends AssemblyAI transcription with Wav2Vec2 acoustic phonetics and multi-tier G2P reference comparison:
+
+```text
+              [FULL SPOKEN RESPONSE]
+                        |
+                        v
+                  [AssemblyAI]
+                        |
+                        v
+              [Full Transcription]
+                        |
+                        v
+              [Word-Level Timestamps]
+                        |
+                        v
+                [Extract Word Clips]
+                        |
+                        v
+                [Wav2Vec2Phoneme]
+                        |
+                        v
+              [Predicted Phonemes]
+                        |
+                        |
+          +-------------+-------------+
+          |                           |
+          v                           v
+    [Expected Word]             [Audio Prediction]
+          |                           |
+          v                           |
+    [G2P / Pronunciation               |
+      Dictionary]                      |
+          |                           |
+          v                           |
+    [Expected Phonemes]                |
+          |                           |
+          +-------------+-------------+
+                        |
+                        v
+              [Phoneme Alignment]
+                        |
+                        v
+             [Difference Detection]
+                        |
+             +----------+----------+
+             |          |          |
+             v          v          v
+        Substitution Deletion  Insertion
+             |          |          |
+             +----------+----------+
+                        |
+                        v
+              [Pronunciation Findings]
+                        |
+                        v
+              [Feedback Generation]
+```
+
+### Phoneme Error Rate (PER) Formula:
+$$\text{PER} = \frac{S + D + I}{N} \times 100$$
+- $S$ = Phoneme substitutions
+- $D$ = Phoneme deletions
+- $I$ = Phoneme insertions
+- $N$ = Number of expected reference phonemes
+
+### Multiple Valid Pronunciations:
+For words with multiple accepted pronunciations (e.g. *either* as `/iː ð ɚ/` or `/aɪ ð ɚ/`), the system aligns against all legitimate variants and automatically matches the variant produced by the speaker, preventing valid accents from being flagged as errors.
+
+### Pronunciation Findings Guardrails:
+All observations are recorded with `confidence_level="requires_validation"` and `validation_status="unvalidated_single_occurrence"` to distinguish single-instance acoustic observations from persistent learner habits.
+
+---
+
+## 6. Research Scope, Pronunciation & Limitations (Section 9)
 
 In adherence to the Articula thesis specification:
 - **WER $\ne$ Pronunciation:** High transcription accuracy indicates agreement with words spoken, not native-like phonological pronunciation.
 - **Provider Confidence $\ne$ Learner Fluency:** AssemblyAI confidence represents acoustic decoding confidence, not speaker proficiency or confidence.
 - **Acoustic Silence $\ne$ Timestamp Gaps:** Gaps between word timestamps in ASR output are only candidate pauses. Silence is verified against the acoustic audio signal.
+- **Wav2Vec2Phoneme Predictions $\ne$ Correctness Scores:** Predicted IPA phonemes from `facebook/wav2vec2-lv-60-espeak-cv-ft` provide observational acoustic data. Dialectal variations (e.g., rhoticity, vowel shifts) and isolated word slicing effects mean phonetic divergence must not be simplistically scored as an error.
 - **No Standardized Proficiency Scores:** Articula does not assign CEFR levels, IELTS bands, or infer emotional states or anxiety. It is designed as an experimental formative practice prototype.
 
 ---
@@ -182,5 +264,6 @@ Under **Research Data & Reproducibility Export**, researchers can download:
 1. **Raw Transcript TXT:** Verbatim AssemblyAI text.
 2. **Per-Test CSV:** Complete row containing all 30+ recording, reference, AssemblyAI, and evaluation variables.
 3. **Token Alignment CSV:** Reference vs recognized word tokens with S, D, I classifications.
-4. **Reproducibility Record JSON:** Provenance audit document containing formulas, thresholds used, normalization policy, software environment, and inputs.
-5. **Session Summary CSV:** Aggregate table across all tests run during the browsing session.
+4. **Phonetic Diagnostics CSV:** Word-level timestamps, ASR confidence, Wav2Vec2 predicted IPA phonemes, and reference IPA.
+5. **Reproducibility Record JSON:** Provenance audit document containing formulas, thresholds used, normalization policy, software environment, inputs, and word-level phonetic predictions.
+6. **Session Summary CSV:** Aggregate table across all tests run during the browsing session.

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Download, FileText, FileSpreadsheet, Code2, ShieldCheck, Check } from 'lucide-react';
+import { Download, FileText, FileSpreadsheet, Code2, ShieldCheck, Check, Sparkles } from 'lucide-react';
 import type {
   EvaluationResponse,
   TestCaseScenario,
@@ -194,7 +194,19 @@ export const ExportCard: React.FC<ExportCardProps> = ({
         annotator_id: currentScenario.annotator_id,
         audio_filename: currentResult?.filename,
         audio_duration_seconds: currentResult?.audio_duration,
+        phoneme_analysis_model: currentResult?.phoneme_analysis?.model || 'facebook/wav2vec2-lv-60-espeak-cv-ft',
       },
+      words_and_phonemes: currentResult?.words?.map((w, idx) => ({
+        token_index: w.token_index ?? (idx + 1),
+        word: w.text,
+        start_ms: w.start,
+        end_ms: w.end,
+        assembly_confidence: w.confidence,
+        phoneme_prediction: w.phoneme_prediction || null,
+        reference_phonemes: w.reference_phonemes || null,
+        segmentation_status: w.segmentation_status || 'valid',
+        segmentation_notes: w.segmentation_notes || null,
+      })) || [],
       evaluation_results: evaluationResult || null,
       security_notice: 'No private API keys, user passwords, or local file paths are included.',
     };
@@ -203,6 +215,53 @@ export const ExportCard: React.FC<ExportCardProps> = ({
       `reproducibility_record_${currentScenario.id}_${Date.now()}.json`,
       JSON.stringify(reproducibilityRecord, null, 2),
       'application/json;charset=utf-8'
+    );
+  };
+
+  // 5. Export Word Phonetic Diagnostics CSV
+  const handleExportPhonemeCsv = () => {
+    if (!currentResult?.words || currentResult.words.length === 0) return;
+
+    const headers = [
+      'token_index',
+      'word',
+      'start_ms',
+      'end_ms',
+      'duration_ms',
+      'assembly_confidence',
+      'predicted_phonemes_ipa',
+      'reference_phonemes_ipa',
+      'segmentation_status',
+      'segmentation_notes',
+    ];
+
+    const escapeCsv = (val: any) => {
+      if (val === null || val === undefined) return '';
+      const str = String(val);
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const rows = currentResult.words.map((w, idx) => [
+      idx + 1,
+      w.text,
+      w.start ?? '',
+      w.end ?? '',
+      (typeof w.start === 'number' && typeof w.end === 'number') ? (w.end - w.start) : '',
+      w.confidence ?? '',
+      w.phoneme_prediction ?? '',
+      w.reference_phonemes ?? '',
+      w.segmentation_status ?? 'valid',
+      w.segmentation_notes ?? '',
+    ].map(escapeCsv));
+
+    const csvContent = `${headers.join(',')}\n${rows.map((r) => r.join(',')).join('\n')}`;
+    triggerDownload(
+      `articula_phonemes_${currentScenario.id}_${Date.now()}.csv`,
+      csvContent,
+      'text/csv;charset=utf-8'
     );
   };
 
@@ -286,7 +345,7 @@ export const ExportCard: React.FC<ExportCardProps> = ({
       </div>
 
       {/* Download Action Buttons */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-2.5">
         {/* Button 1: Verbatim Transcript TXT */}
         <button
           onClick={handleExportTxt}
@@ -341,7 +400,25 @@ export const ExportCard: React.FC<ExportCardProps> = ({
           </div>
         </button>
 
-        {/* Button 4: Reproducibility Record JSON */}
+        {/* Button 4: Phonetic Diagnostics CSV */}
+        <button
+          onClick={handleExportPhonemeCsv}
+          disabled={!currentResult?.words || currentResult.words.length === 0}
+          className="p-3 bg-slate-950/70 hover:bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-lg text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
+        >
+          <div className="flex items-center justify-between text-purple-400 mb-1">
+            <Sparkles className="w-4 h-4" />
+            <span className="text-[10px] font-mono text-slate-500 uppercase">.csv</span>
+          </div>
+          <div className="text-xs font-semibold text-white group-hover:text-purple-300">
+            Phonetic Diagnostics CSV
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">
+            Wav2Vec2 IPA predictions & timestamps
+          </div>
+        </button>
+
+        {/* Button 5: Reproducibility Record JSON */}
         <button
           onClick={handleExportReproducibilityRecord}
           disabled={!evaluationResult}
