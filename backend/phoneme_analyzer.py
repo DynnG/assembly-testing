@@ -255,29 +255,56 @@ def extract_word_segment(
     start_ms: Optional[Union[int, float]],
     end_ms: Optional[Union[int, float]],
     padding_ms: int = 25,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str, Optional[str]]:
+    min_duration_ms: int = 30,
+    return_details: bool = False,
+) -> Union[
+    Tuple[Optional[np.ndarray], Optional[np.ndarray], str, Optional[str]],
+    Tuple[Optional[np.ndarray], Optional[np.ndarray], str, str, Dict[str, Any], Optional[str]],
+]:
     """
     Extracts an individual word audio segment from the original native audio signal.
 
     Algorithm:
-    1. Converts AssemblyAI millisecond timestamps to exact sample indices using native_sr:
+    1. Interprets AssemblyAI timestamps in milliseconds.
+    2. Converts millisecond timestamps to sample indices using the native sample rate:
        start_sample = int((start_ms / 1000) * native_sr)
        end_sample = int((end_ms / 1000) * native_sr)
-    2. Applies configurable boundary padding (default 25 ms) to preserve plosive release bursts,
-       fricative onsets, and coda transitions while bounding within original audio duration.
-    3. Resamples extracted segment to 16 kHz mono for Wav2Vec2 acoustic model.
+    3. Preserves original word boundaries separate from padded extraction boundaries.
+    4. Applies configurable boundary padding (default 25 ms) bounded by audio waveform limits.
+    5. Resamples extracted segment to 16 kHz mono for Wav2Vec2 acoustic model.
+    6. Validates audio quality (duration thresholds, silence energy, clipping).
 
     Returns:
-        (word_slice_native, word_slice_16k, segmentation_status, segmentation_notes)
+        If return_details=False (backward compatibility):
+            (word_slice_native, word_slice_16k, segmentation_status, notes_str)
+        If return_details=True:
+            (word_slice_native, word_slice_16k, segmentation_status, audio_quality_status, timing_dict, notes_str)
     """
+    timing_dict = {
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "raw_duration_ms": (end_ms - start_ms) if (start_ms is not None and end_ms is not None) else None,
+        "padded_start_ms": None,
+        "padded_end_ms": None,
+        "padded_duration_ms": None,
+        "padding_applied_ms": padding_ms,
+    }
+
     if start_ms is None or end_ms is None:
-        return None, None, "missing_timestamps", "AssemblyAI did not return start or end timestamps for this token."
+        err_note = "AssemblyAI did not return start or end timestamps for this token."
+        if not return_details:
+            return None, None, "missing_timestamps", err_note
+        return None, None, "missing_timestamps", "too_short", timing_dict, err_note
 
     if end_ms <= start_ms:
-        return None, None, "invalid_duration", f"End timestamp ({end_ms}ms) <= start timestamp ({start_ms}ms)."
+        err_note = f"End timestamp ({end_ms}ms) <= start timestamp ({start_ms}ms)."
+        if not return_details:
+            return None, None, "invalid_duration", err_note
+        return None, None, "invalid_duration", "too_short", timing_dict, err_note
 
     total_samples = len(audio_native)
     total_duration_sec = total_samples / native_sr
+    raw_dur_ms = end_ms - start_ms
 
     # Timestamp conversion to sample indices at native sample rate
     start_sec = max(0.0, start_ms / 1000.0)
@@ -288,11 +315,20 @@ def extract_word_segment(
     padded_start_sec = max(0.0, start_sec - pad_sec)
     padded_end_sec = min(total_duration_sec, end_sec + pad_sec)
 
+    padded_start_ms = int(padded_start_sec * 1000.0)
+    padded_end_ms = int(padded_end_sec * 1000.0)
+    timing_dict["padded_start_ms"] = padded_start_ms
+    timing_dict["padded_end_ms"] = padded_end_ms
+    timing_dict["padded_duration_ms"] = padded_end_ms - padded_start_ms
+
     start_idx = int(padded_start_sec * native_sr)
     end_idx = int(padded_end_sec * native_sr)
 
     if start_idx >= total_samples or end_idx <= start_idx:
-        return None, None, "out_of_bounds", "Calculated sample indices fall outside audio waveform boundaries."
+        err_note = "Calculated sample indices fall outside audio waveform boundaries."
+        if not return_details:
+            return None, None, "out_of_bounds", err_note
+        return None, None, "out_of_bounds", "too_short", timing_dict, err_note
 
     # Extract slice from original recording
     word_slice_native = audio_native[start_idx:end_idx]
@@ -302,29 +338,39 @@ def extract_word_segment(
 
     # Quality and duration checks on 16k slice
     notes = []
-    status = "valid"
+    seg_status = "valid"
+    quality_status = "normal"
 
-    if len(word_slice_16k) < 400:
-        notes.append("Segment duration is under 25ms (under acoustic model receptive field); phonetic inference skipped.")
+    if raw_dur_ms < min_duration_ms or len(word_slice_16k) < 400:
+        quality_status = "too_short"
+        notes.append(f"Segment duration is under 25ms ({raw_dur_ms}ms raw duration, under threshold); phonetic inference skipped.")
     elif len(word_slice_16k) < 480:
-        notes.append("Segment duration is under 30ms; phonetic prediction may be imprecise.")
+        notes.append("Segment duration is under 30ms; phonetic prediction may be imprecise due to boundary coarticulation.")
 
-    rms_energy = np.sqrt(np.mean(word_slice_16k**2)) if len(word_slice_16k) > 0 else 0.0
+    rms_energy = float(np.sqrt(np.mean(word_slice_16k**2))) if len(word_slice_16k) > 0 else 0.0
     if rms_energy < 1e-4:
-        status = "near_silence"
+        quality_status = "near_silence"
         notes.append("Audio segment energy is near zero (silent or inaudible transient).")
 
+    # Check for severe clipping
+    if len(word_slice_16k) > 0 and float(np.max(np.abs(word_slice_16k))) >= 0.999:
+        notes.append("Audio slice exhibits digital peak clipping (>0.999 amplitude).")
+
     notes_str = "; ".join(notes) if notes else None
-    return word_slice_native, word_slice_16k, status, notes_str
+    if not return_details:
+        return word_slice_native, word_slice_16k, seg_status, notes_str
+
+    return word_slice_native, word_slice_16k, seg_status, quality_status, timing_dict, notes_str
 
 
 def predict_phonemes_batch(
-    audio_slices_16k: List[np.ndarray],
+    audio_slices_16k: List[Optional[np.ndarray]],
     batch_size: int = 16,
 ) -> List[Tuple[Optional[str], List[str], Optional[str]]]:
     """
     Performs batched acoustic phoneme prediction using Wav2Vec2Phoneme (espeak-cv-ft).
     Loads model once and runs inference in torch.inference_mode() with dynamic padding.
+    Uses phoneme-level tokenization to decode continuous unspaced acoustic outputs.
 
     Returns:
         List of tuples: (phoneme_str, phoneme_tokens, error_note)
@@ -370,8 +416,10 @@ def predict_phonemes_batch(
                 decoded_list = processor.batch_decode(predicted_ids)
 
             for idx, decoded in zip(b_indices, decoded_list):
-                cleaned_str = decoded.strip()
-                tokens = [t for t in cleaned_str.split(" ") if t]
+                raw_str = decoded.strip()
+                # Use robust phoneme-level tokenization (greedy multi-char parsing)
+                tokens = tokenize_phoneme_sequence(raw_str)
+                cleaned_str = " ".join(tokens)
                 results[idx] = (cleaned_str, tokens, None)
         except Exception as inf_exc:
             for idx in b_indices:
@@ -571,12 +619,13 @@ def analyze_words_phonemes(
         # Pre-resolve expected phonemes
         ref_res = _EXPECTED_GENERATOR.generate_expected(raw_text, preferred_accent=preferred_accent)
 
-        slice_native, slice_16k, seg_status, seg_notes = extract_word_segment(
+        slice_native, slice_16k, seg_status, quality_status, timing_dict, seg_notes = extract_word_segment(
             audio_native=audio_native,
             native_sr=native_sr,
             start_ms=start_ms,
             end_ms=end_ms,
             padding_ms=padding_ms,
+            return_details=True,
         )
 
         # Generate base64 WAV clip for UI playback
@@ -584,19 +633,25 @@ def analyze_words_phonemes(
         if slice_16k is not None and len(slice_16k) > 0:
             clip_b64 = encode_slice_to_wav_base64(slice_16k, sample_rate=16000)
 
+        is_eligible = (seg_status == "valid" and quality_status == "normal")
+        init_analysis_status = "pending" if is_eligible else f"skipped_{quality_status}"
+
         record = {
             "word_id": idx + 1,
             "token_index": idx + 1,
             "text": raw_text,
             "word": raw_text,
-            "start_ms": start_ms,
-            "end_ms": end_ms,
-            "start": start_ms,
-            "end": end_ms,
+            "start_ms": timing_dict["start_ms"],
+            "end_ms": timing_dict["end_ms"],
+            "start": timing_dict["start_ms"],
+            "end": timing_dict["end_ms"],
+            "duration_ms": timing_dict["raw_duration_ms"],
+            "padded_start_ms": timing_dict["padded_start_ms"],
+            "padded_end_ms": timing_dict["padded_end_ms"],
+            "padded_duration_ms": timing_dict["padded_duration_ms"],
             "confidence": confidence,
             "assembly_confidence": confidence,
             "speaker": speaker,
-            "duration_ms": duration_ms,
             "audio_clip": clip_filename,
             "audio_clip_base64": clip_b64,
             "phoneme_prediction": None,
@@ -615,14 +670,17 @@ def analyze_words_phonemes(
             "per_metrics": None,
             "pronunciation_findings": [],
             "findings_count": 0,
-            "analysis_status": "pending",
+            "analysis_status": "pending" if is_eligible else "skipped",
+            "phoneme_analysis_status": init_analysis_status,
             "segmentation_status": seg_status,
+            "audio_quality_status": quality_status,
             "segmentation_notes": seg_notes,
-            "requires_human_review": False,
+            "quality_notes": seg_notes,
+            "requires_human_review": not is_eligible,
         }
 
         word_records.append(record)
-        slices_for_inference.append(slice_16k if seg_status == "valid" else None)
+        slices_for_inference.append(slice_16k if is_eligible else None)
 
     # 3. Targeted batched phonetic analysis
     eligible_slices = [s if s is not None else np.zeros(0, dtype=np.float32) for s in slices_for_inference]
@@ -633,10 +691,11 @@ def analyze_words_phonemes(
         rec = word_records[idx]
         word_text = rec["word"]
 
-        if pred_str is not None:
+        if pred_str is not None and rec["audio_quality_status"] == "normal":
             rec["phoneme_prediction"] = pred_str
             rec["phoneme_tokens"] = tokens
             rec["analysis_status"] = "completed"
+            rec["phoneme_analysis_status"] = "completed"
 
             # Execute Expected vs Predicted Phoneme Comparison
             comparison = compare_word_phonemes(
@@ -661,6 +720,7 @@ def analyze_words_phonemes(
             rec["per_metrics"] = comparison["per_metrics"]
             rec["pronunciation_findings"] = comparison["pronunciation_findings"]
             rec["findings_count"] = comparison["findings_count"]
+            rec["comparison_status"] = comparison.get("comparison_status", "completed")
 
             rec["requires_human_review"] = check_requires_human_review(
                 confidence=rec["assembly_confidence"],
@@ -676,10 +736,20 @@ def analyze_words_phonemes(
                     rec["segmentation_notes"] += f"; {err_note}"
                 else:
                     rec["segmentation_notes"] = err_note
-                rec["analysis_status"] = "skipped" if "under 25ms" in str(rec["segmentation_notes"]) else "error"
+                rec["quality_notes"] = rec["segmentation_notes"]
+
+            if rec["audio_quality_status"] != "normal":
+                rec["phoneme_analysis_status"] = f"skipped_{rec['audio_quality_status']}"
+                rec["analysis_status"] = "skipped"
+            elif err_note:
+                rec["phoneme_analysis_status"] = "error"
+                rec["analysis_status"] = "error"
             else:
+                rec["phoneme_analysis_status"] = "skipped"
                 rec["analysis_status"] = "skipped"
 
+            rec["comparison_status"] = "prediction_unavailable"
+            rec["phoneme_error_rate"] = None
             rec["requires_human_review"] = True
 
     if return_unified:

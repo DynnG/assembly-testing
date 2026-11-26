@@ -534,7 +534,8 @@ PHONEME_PROFILES: Dict[str, Dict[str, Any]] = {
 KNOWN_MULTI_CHAR_IPA: List[str] = [
     "tʃ", "dʒ", "aɪ", "eɪ", "oʊ", "aʊ", "ɔɪ", "əʊ",
     "iː", "uː", "ɔː", "ɑː", "ɜː", "aː", "eː", "oː",
-    "iə", "eə", "ʊə", "ə˞", "ɑːɹ", "ɔːɹ", "ts", "dz"
+    "iə", "eə", "ʊə", "ə˞", "ɑːɹ", "ɔːɹ", "ts", "dz",
+    "ɚ", "ɝ", "aʊ", "eɪ", "oʊ"
 ]
 
 
@@ -545,19 +546,20 @@ def normalize_ipa_symbol(symbol: str) -> str:
     - Unifies Latin 'g' (U+0067) to IPA script 'ɡ' (U+0261) used by Wav2Vec2/eSpeak.
     - Unifies length marker ascii ':' to IPA length mark 'ː' (U+02D0).
     - Removes combining tie bars (U+0361, U+035C).
-    - Strips stress markers (ˈ, ˌ) from individual phoneme identities.
+    - Strips stress markers (ˈ, ˌ) and quotation marks from individual phoneme identities.
+    - Preserves meaningful phonetic distinctions (e.g. θ, ð, ŋ, ʃ, ʒ, ɪ, ə, æ, ʊ, ɑ).
     """
     if not symbol:
         return ""
 
     s = unicodedata.normalize("NFC", symbol)
     # Remove stress marks and pitch numbers
-    s = s.replace("ˈ", "").replace("ˌ", "").replace("'", "")
+    s = s.replace("ˈ", "").replace("ˌ", "").replace("'", "").replace("\"", "")
     # Remove tie bars
     s = s.replace("\u0361", "").replace("\u035c", "")
-    # Normalize g to IPA ɡ
+    # Normalize Latin g to IPA script ɡ
     s = s.replace("g", "ɡ")
-    # Normalize length mark
+    # Normalize ASCII colon to IPA triangular length mark
     s = s.replace(":", "ː")
     # Strip eSpeak tone digits if any (e.g. 'a5' -> 'a')
     if len(s) > 1 and s[-1].isdigit():
@@ -565,7 +567,30 @@ def normalize_ipa_symbol(symbol: str) -> str:
     return s.strip()
 
 
-def tokenize_phoneme_sequence(phoneme_input: Union[str, List[str]]) -> List[str]:
+def _tokenize_continuous_string(clean_str: str) -> List[str]:
+    """Helper to parse a continuous IPA string into discrete phoneme tokens greedily."""
+    if not clean_str:
+        return []
+    tokens: List[str] = []
+    i = 0
+    n = len(clean_str)
+    sorted_multi = sorted(set(KNOWN_MULTI_CHAR_IPA), key=len, reverse=True)
+
+    while i < n:
+        matched = False
+        for mc in sorted_multi:
+            if clean_str[i : i + len(mc)] == mc:
+                tokens.append(mc)
+                i += len(mc)
+                matched = True
+                break
+        if not matched:
+            tokens.append(clean_str[i])
+            i += 1
+    return tokens
+
+
+def tokenize_phoneme_sequence(phoneme_input: Union[str, List[str], Any]) -> List[str]:
     """
     Tokenizes phoneme sequences into discrete phonetic sound units.
     Operates on phoneme tokens, preserving multi-character sounds (e.g. /tʃ/, /dʒ/, /oʊ/, /aɪ/).
@@ -573,14 +598,23 @@ def tokenize_phoneme_sequence(phoneme_input: Union[str, List[str]]) -> List[str]
     Accepts:
     - Space-separated IPA string: "θ ˈɪ ŋ k" -> ["θ", "ɪ", "ŋ", "k"]
     - Token list: ["s", "m", "oʊ", "k"] -> ["s", "m", "oʊ", "k"]
-    - Continuous IPA string: parses greedily using known IPA phonemes.
+    - Unspaced continuous string: "əɜ" -> ["ə", "ɜ"]
+    - List containing unspaced elements: ["əɜ"] -> ["ə", "ɜ"]
     """
     if isinstance(phoneme_input, list):
         tokens = []
         for t in phoneme_input:
-            norm = normalize_ipa_symbol(str(t))
-            if norm:
+            t_str = str(t).strip()
+            if not t_str:
+                continue
+            norm = normalize_ipa_symbol(t_str)
+            # If element is already a single char or known multi-char token
+            if len(norm) == 1 or norm in KNOWN_MULTI_CHAR_IPA or norm in PHONEME_PROFILES:
                 tokens.append(norm)
+            else:
+                # If element contains unseparated phonemes like 'əɜ' or 'smʊk'
+                sub_tokens = _tokenize_continuous_string(norm)
+                tokens.extend(sub_tokens)
         return tokens
 
     if not isinstance(phoneme_input, str):
@@ -595,32 +629,17 @@ def tokenize_phoneme_sequence(phoneme_input: Union[str, List[str]]) -> List[str]
         tokens = []
         for part in raw.split():
             norm = normalize_ipa_symbol(part)
-            if norm:
+            if not norm:
+                continue
+            if len(norm) == 1 or norm in KNOWN_MULTI_CHAR_IPA or norm in PHONEME_PROFILES:
                 tokens.append(norm)
+            else:
+                tokens.extend(_tokenize_continuous_string(norm))
         return tokens
 
     # Continuous string fallback: greedy multi-char matching
     clean_str = normalize_ipa_symbol(raw)
-    tokens: List[str] = []
-    i = 0
-    n = len(clean_str)
-
-    # Sort multi-char phonemes longest-first for greedy matching
-    sorted_multi = sorted(KNOWN_MULTI_CHAR_IPA, key=len, reverse=True)
-
-    while i < n:
-        matched = False
-        for mc in sorted_multi:
-            if clean_str[i : i + len(mc)] == mc:
-                tokens.append(mc)
-                i += len(mc)
-                matched = True
-                break
-        if not matched:
-            tokens.append(clean_str[i])
-            i += 1
-
-    return tokens
+    return _tokenize_continuous_string(clean_str)
 
 
 def arpabet_to_ipa(arpabet_tokens: List[str]) -> List[str]:
@@ -967,13 +986,14 @@ def align_phoneme_sequences(
     # PER = (S + D + I) / N * 100
     if n > 0:
         per = round(((substitutions + deletions + insertions) / n) * 100.0, 2)
-        per_status = "valid"
+        per_status = "completed"
     else:
         if m == 0:
             per = 0.0
             per_status = "empty_sequences"
         else:
-            per = 100.0
+            # When reference phonemes are missing/unavailable, PER must not be silently reported as 100% or 0%
+            per = None
             per_status = "reference_unavailable"
 
     metrics = {
@@ -1182,26 +1202,38 @@ def compare_word_phonemes(
     )
 
     # 4. Determine analysis status and human review recommendation
-    has_substitutions_or_deletions = any(
-        item["operation"] in ("substitution", "deletion") for item in alignment
-    )
     requires_review = False
     if assembly_confidence is not None and assembly_confidence < 0.85:
         requires_review = True
-    elif per_metrics["phoneme_error_rate"] > 0:
+    elif per_metrics["phoneme_error_rate"] is not None and per_metrics["phoneme_error_rate"] > 0:
         requires_review = True
     elif ref_result.status == "unsupported":
         requires_review = True
+    elif not predicted_tokens:
+        requires_review = True
 
-    analysis_status = "completed"
-    if ref_result.status == "unsupported" and not predicted_tokens:
+    if ref_result.status == "unsupported":
         analysis_status = "unsupported"
+        comparison_status = "reference_unavailable"
     elif not predicted_tokens:
         analysis_status = "prediction_missing"
+        comparison_status = "prediction_unavailable"
+    else:
+        analysis_status = "completed"
+        comparison_status = "completed"
+
+    raw_pred_str = " ".join(predicted_tokens) if predicted_tokens else ""
+    raw_ref_str = ref_result.expected_phonemes_str
 
     return {
         "word": word,
         "assembly_confidence": assembly_confidence,
+        "predicted_phonemes_raw": raw_pred_str,
+        "reference_phonemes_raw": raw_ref_str,
+        "predicted_phonemes_normalized": predicted_tokens,
+        "reference_phonemes_normalized": selected_tokens,
+        "normalization_status": "completed" if ref_result.status != "unsupported" else "unsupported",
+        "comparison_status": comparison_status,
         "expected_phonemes": selected_tokens,
         "expected_phonemes_str": " ".join(selected_tokens),
         "predicted_phonemes": predicted_tokens,

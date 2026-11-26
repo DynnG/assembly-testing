@@ -8,6 +8,7 @@ import { TranscriptionResultsCard } from './components/TranscriptionResultsCard'
 import { ReferenceAndWerCard } from './components/ReferenceAndWerCard';
 import { SpeechMeasurementsCard } from './components/SpeechMeasurementsCard';
 import { WordDiagnosticCard } from './components/WordDiagnosticCard';
+import { AiAnalysisSummaryCard } from './components/AiAnalysisSummaryCard';
 import { EvaluationResultsCard } from './components/EvaluationResultsCard';
 import { ExportCard } from './components/ExportCard';
 import { SessionHistoryCard } from './components/SessionHistoryCard';
@@ -568,7 +569,16 @@ export const App: React.FC = () => {
           isProcessing={isTranscribing}
         />
 
-        {/* Section E: Word-Level Diagnostic & Timestamp Inspector */}
+        {/* Section E: AI-Assisted Analysis Summary & Articulatory Phonetics */}
+        {currentResult && (
+          <AiAnalysisSummaryCard
+            currentResult={currentResult}
+            evaluationResult={evaluationResult}
+            preferredAccent="General American"
+          />
+        )}
+
+        {/* Section F: Word-Level Diagnostic & Timestamp Inspector */}
         {currentResult?.words && currentResult.words.length > 0 && (
           <WordDiagnosticCard
             words={currentResult.words}

@@ -449,6 +449,12 @@ def compute_quantitative_errors(
 
     mean_signed = round(sum(signed_diffs) / len(signed_diffs), 3)
 
+    sample_note = (
+        "Single-pair observation (n=1); aggregate statistics (MAE, Median AE) represent a single trial."
+        if len(paired_values) == 1
+        else f"Calculated across {len(paired_values)} paired test samples."
+    )
+
     return {
         "eligible_pairs_count": len(paired_values),
         "mean_absolute_error": mae,
@@ -456,6 +462,7 @@ def compute_quantitative_errors(
         "mean_signed_difference": mean_signed,
         "signed_differences": signed_diffs,
         "unit": unit_label,
+        "sample_note": sample_note,
         "status": "valid",
         "reason": None,
     }
@@ -468,8 +475,8 @@ def evaluate_event_detection(
 ) -> Dict[str, Any]:
     """
     Evaluates event detection (pauses, repetitions) against manually verified references.
-    Implements 1-to-1 matching with temporal tolerance.
-    Returns Precision, Recall, and F1.
+    Implements 1-to-1 temporal matching with configurable tolerance.
+    Returns Precision, Recall, F1, and detailed classification explanations for every event.
     """
     num_det = len(detected_events)
     num_ref = len(reference_events)
@@ -482,16 +489,20 @@ def evaluate_event_detection(
             "precision": None,
             "recall": None,
             "f1_score": None,
+            "tolerance_seconds": tolerance_seconds,
+            "matching_details": [],
             "status": "undefined",
             "reason": "Both detected and reference event counts are zero (no events to evaluate).",
         }
 
-    # Match detected to reference based on timestamps or token index
+    # Track 1-to-1 matching
     matched_refs = set()
+    matching_details = []
     tp = 0
 
-    for det in detected_events:
-        det_start = det.get("start_seconds") or det.get("token_index")
+    for d_idx, det in enumerate(detected_events):
+        det_start = det.get("start_seconds") if det.get("start_seconds") is not None else det.get("token_index")
+        det_dur = det.get("duration_seconds")
         if det_start is None:
             continue
 
@@ -502,7 +513,7 @@ def evaluate_event_detection(
             if r_idx in matched_refs:
                 continue
 
-            ref_start = ref.get("start_seconds") or ref.get("token_index")
+            ref_start = ref.get("start_seconds") if ref.get("start_seconds") is not None else ref.get("token_index")
             if ref_start is None:
                 continue
 
@@ -514,6 +525,40 @@ def evaluate_event_detection(
         if best_match_idx is not None:
             matched_refs.add(best_match_idx)
             tp += 1
+            matching_details.append({
+                "event_id": f"det-{d_idx + 1}",
+                "classification": "TP",
+                "detected_start": det_start,
+                "detected_duration": det_dur,
+                "matched_ref_index": best_match_idx + 1,
+                "temporal_distance_seconds": round(min_dist, 3),
+                "explanation": f"Detected event at {det_start}s matches reference event #{best_match_idx + 1} (offset: {round(min_dist, 3)}s <= {tolerance_seconds}s tolerance).",
+            })
+        else:
+            matching_details.append({
+                "event_id": f"det-{d_idx + 1}",
+                "classification": "FP",
+                "detected_start": det_start,
+                "detected_duration": det_dur,
+                "matched_ref_index": None,
+                "temporal_distance_seconds": None,
+                "explanation": f"Detected event at {det_start}s has no unmatched reference event within {tolerance_seconds}s tolerance (false positive).",
+            })
+
+    # Record false negatives (unmatched reference events)
+    for r_idx, ref in enumerate(reference_events):
+        if r_idx not in matched_refs:
+            ref_start = ref.get("start_seconds") if ref.get("start_seconds") is not None else ref.get("token_index")
+            ref_dur = ref.get("duration_seconds")
+            matching_details.append({
+                "event_id": f"ref-{r_idx + 1}",
+                "classification": "FN",
+                "detected_start": None,
+                "detected_duration": None,
+                "matched_ref_index": r_idx + 1,
+                "temporal_distance_seconds": None,
+                "explanation": f"Reference event #{r_idx + 1} at {ref_start}s was not detected by the automatic detector within {tolerance_seconds}s tolerance (false negative).",
+            })
 
     fp = num_det - tp
     fn = num_ref - tp
@@ -521,8 +566,13 @@ def evaluate_event_detection(
     precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else None
     recall = round(tp / (tp + fn), 4) if (tp + fn) > 0 else None
 
-    if precision is not None and recall is not None and (precision + recall) > 0:
-        f1 = round((2.0 * precision * recall) / (precision + recall), 4)
+    # Standard convention: If TP = 0 and there are false positives or false negatives,
+    # F1 is 0.0 (0%), rather than undefined/None.
+    if precision is not None and recall is not None:
+        if (precision + recall) > 0:
+            f1 = round((2.0 * precision * recall) / (precision + recall), 4)
+        else:
+            f1 = 0.0
     else:
         f1 = None
 
@@ -534,6 +584,7 @@ def evaluate_event_detection(
         "recall": recall,
         "f1_score": f1,
         "tolerance_seconds": tolerance_seconds,
+        "matching_details": matching_details,
         "status": "valid" if (precision is not None or recall is not None) else "undefined",
         "reason": None if (precision is not None and recall is not None) else "Zero in denominator.",
     }

@@ -173,3 +173,92 @@ export async function analyzeSilenceBackend(
 
   return await parseResponse<SilenceAnalysisResult>(res, 'Silence analysis failed');
 }
+
+/**
+ * Request evidence-constrained AI analysis summary.
+ */
+export async function generateAiSummary(payload: {
+  full_transcription: string;
+  words: any[];
+  pronunciation_findings: any[];
+  evaluation_metrics?: any;
+  preferred_accent?: string;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/ai-summary`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseResponse<any>(res, 'AI summary generation failed');
+}
+
+/**
+ * Downloads technical phonemes dataset CSV with UTF-8 BOM encoding directly from backend.
+ */
+export async function downloadBackendCsv(payload: {
+  recording_id?: string;
+  words: any[];
+}): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/export/csv`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(`CSV export failed (HTTP ${res.status})`);
+  }
+  return await res.blob();
+}
+
+/**
+ * Downloads multi-sheet Excel spreadsheet (.xlsx) directly from backend.
+ */
+export async function downloadBackendXlsx(payload: {
+  recording_id?: string;
+  full_transcription?: string;
+  words: any[];
+  pronunciation_findings?: any[];
+  evaluation_metrics?: any;
+  ai_summary?: any;
+}): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/export/xlsx`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(`Excel export failed (HTTP ${res.status})`);
+  }
+  return await res.blob();
+}
+
+/**
+ * Downloads human-readable research and learner evaluation report (.txt).
+ */
+export async function downloadBackendReport(payload: {
+  recording_id?: string;
+  full_transcription?: string;
+  words: any[];
+  pronunciation_findings?: any[];
+  evaluation_metrics?: any;
+  ai_summary?: any;
+}): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/export/report`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(`Report export failed (HTTP ${res.status})`);
+  }
+  return await res.blob();
+}

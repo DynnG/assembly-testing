@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import time
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 import httpx
 
@@ -27,6 +29,15 @@ from phoneme_comparison import (
     ExpectedPhonemeGenerator,
     compare_word_phonemes,
     tokenize_phoneme_sequence,
+)
+from export_service import (
+    generate_phoneme_dataset_csv,
+    generate_phoneme_dataset_xlsx,
+    generate_human_readable_report_txt,
+)
+from ai_summary_service import (
+    build_expert_rule_based_summary,
+    generate_llm_analysis_summary,
 )
 
 # Reference pronunciation generator singleton for API endpoints
@@ -490,6 +501,20 @@ async def transcribe_audio(
     # Explicitly release memory reference to uploaded audio bytes
     del audio_content
 
+    # Generate initial AI-assisted interpretation from validated findings
+    ai_summary_result = None
+    if phoneme_analysis and cleaned_words:
+        try:
+            findings_for_summary = hybrid_result.get("pronunciation_findings", []) if "hybrid_result" in locals() and isinstance(hybrid_result, dict) else []
+            ai_summary_result = build_expert_rule_based_summary(
+                full_transcription=full_text,
+                words=cleaned_words,
+                pronunciation_findings=findings_for_summary,
+                preferred_accent="General English",
+            )
+        except Exception:
+            ai_summary_result = None
+
     return {
         "success": True,
         "id": transcript_id,
@@ -505,6 +530,7 @@ async def transcribe_audio(
         "phoneme_analysis": phoneme_meta,
         "pronunciation_summary": hybrid_result.get("pronunciation_summary") if (phoneme_analysis and "hybrid_result" in locals() and isinstance(hybrid_result, dict)) else None,
         "pronunciation_findings": hybrid_result.get("pronunciation_findings") if (phoneme_analysis and "hybrid_result" in locals() and isinstance(hybrid_result, dict)) else [],
+        "ai_summary": ai_summary_result,
         "processing_time_sec": elapsed_time,
         "filename": filename,
         "silence_analysis": silence_result,
@@ -768,4 +794,104 @@ def evaluate_endpoint(req: EvaluationRequest):
             },
         },
     }
+
+
+# ============================================================================
+# Phase 7 & 9: AI Summary and Export Endpoints
+# ============================================================================
+
+class AISummaryRequest(BaseModel):
+    full_transcription: str = Field("", description="Recognized utterance transcription")
+    words: List[Dict[str, Any]] = Field(default_factory=list, description="Array of enriched word records")
+    pronunciation_findings: List[Dict[str, Any]] = Field(default_factory=list, description="Validated phonetic findings")
+    evaluation_metrics: Optional[Dict[str, Any]] = Field(None, description="Speech rate, pause, and WER evaluation results")
+    preferred_accent: Optional[str] = Field("General English", description="Target English variety")
+
+
+@app.post("/ai-summary", summary="Generate evidence-constrained AI analysis summary")
+async def ai_summary_endpoint(req: AISummaryRequest):
+    """
+    Produces structured AI interpretation grounded strictly on validated acoustic
+    and phonetic findings. Does not diagnose raw audio or invent findings.
+    """
+    summary = await generate_llm_analysis_summary(
+        full_transcription=req.full_transcription,
+        words=req.words,
+        pronunciation_findings=req.pronunciation_findings,
+        evaluation_metrics=req.evaluation_metrics,
+        preferred_accent=req.preferred_accent or "General English",
+    )
+    return {
+        "success": True,
+        **summary,
+    }
+
+
+class ExportDataRequest(BaseModel):
+    recording_id: Optional[str] = Field("recording_001")
+    full_transcription: Optional[str] = Field("")
+    words: List[Dict[str, Any]] = Field(default_factory=list)
+    pronunciation_findings: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    evaluation_metrics: Optional[Dict[str, Any]] = Field(None)
+    ai_summary: Optional[Dict[str, Any]] = Field(None)
+
+
+@app.post("/export/csv", summary="Export technical dataset CSV with UTF-8 BOM encoding")
+def export_csv_endpoint(req: ExportDataRequest):
+    """
+    Generates and downloads a technical dataset CSV encoded in UTF-8 with BOM (utf-8-sig)
+    for seamless opening in Microsoft Excel without corrupting Unicode IPA characters.
+    """
+    csv_bytes = generate_phoneme_dataset_csv(req.words)
+    filename = f"articula_phonemes_{req.recording_id or 'export'}.csv"
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/export/xlsx", summary="Export professionally formatted Excel workbook (.xlsx)")
+def export_xlsx_endpoint(req: ExportDataRequest):
+    """
+    Generates and downloads a multi-sheet Microsoft Excel workbook (.xlsx)
+    guaranteeing native cell Unicode preservation of all IPA phonetic symbols.
+    """
+    xlsx_bytes = generate_phoneme_dataset_xlsx(
+        recording_id=req.recording_id or "recording_001",
+        full_transcription=req.full_transcription or "",
+        words=req.words,
+        pronunciation_findings=req.pronunciation_findings,
+        evaluation_metrics=req.evaluation_metrics,
+        ai_summary=req.ai_summary,
+    )
+    filename = f"articula_evaluation_{req.recording_id or 'export'}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/export/report", summary="Export human-readable research and learner evaluation report")
+def export_report_endpoint(req: ExportDataRequest):
+    """
+    Generates a structured human-readable text report containing summary cards,
+    AI observations, and words requiring human review.
+    """
+    report_text = generate_human_readable_report_txt(
+        recording_id=req.recording_id or "recording_001",
+        full_transcription=req.full_transcription or "",
+        words=req.words,
+        pronunciation_findings=req.pronunciation_findings,
+        evaluation_metrics=req.evaluation_metrics,
+        ai_summary=req.ai_summary,
+    )
+    filename = f"articula_report_{req.recording_id or 'export'}.txt"
+    return StreamingResponse(
+        io.BytesIO(report_text.encode("utf-8")),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 

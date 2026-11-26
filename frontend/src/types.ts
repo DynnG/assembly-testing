@@ -19,10 +19,14 @@ export interface WordMetadata {
   end: number;
   start_ms?: number;
   end_ms?: number;
+  duration_ms?: number | null;
+  raw_duration_ms?: number | null;
+  padded_start_ms?: number | null;
+  padded_end_ms?: number | null;
+  padded_duration_ms?: number | null;
   confidence: number;
   assembly_confidence?: number;
   speaker?: string | null;
-  duration_ms?: number | null;
   audio_clip?: string | null;
   phoneme_prediction?: string | null;
   reference_phonemes?: string | null;
@@ -31,6 +35,12 @@ export interface WordMetadata {
   expected_phonemes_str?: string;
   predicted_phonemes?: string[];
   predicted_phonemes_str?: string;
+  predicted_phonemes_raw?: string;
+  reference_phonemes_raw?: string;
+  predicted_phonemes_normalized?: string[];
+  reference_phonemes_normalized?: string[];
+  normalization_status?: string;
+  comparison_status?: string;
   reference_source?: string;
   reference_variants?: string[];
   selected_variant_index?: number;
@@ -50,8 +60,35 @@ export interface WordMetadata {
   audio_clip_base64?: string | null;
   analysis_status?: string;
   segmentation_status?: 'valid' | 'missing_timestamps' | 'invalid_duration' | 'out_of_bounds' | 'near_silence' | 'error';
+  audio_quality_status?: 'normal' | 'too_short' | 'near_silence' | 'clipped' | 'low_energy';
+  phoneme_analysis_status?: string;
   segmentation_notes?: string | null;
+  quality_notes?: string | null;
   requires_human_review?: boolean;
+}
+
+export interface PronunciationObservation {
+  word: string;
+  target_phoneme: string;
+  predicted_phoneme: string;
+  difference_type: string;
+  phoneme_position: number;
+  observation: string;
+  supporting_evidence: string;
+  possible_articulation_explanation: string;
+  practice_recommendation: string[];
+  validation_status: string;
+}
+
+export interface AiAnalysisSummary {
+  overall_summary: string;
+  pronunciation_observations: PronunciationObservation[];
+  speech_timing_observations: string[];
+  audio_quality_warnings: string[];
+  limitations: string[];
+  human_review_recommendations: string[];
+  generation_method?: string;
+  evidence_traceability?: Record<string, any>;
 }
 
 export interface DisfluencyPrompt {
@@ -134,6 +171,7 @@ export interface TranscriptionResponse {
     accent_variety?: string;
   } | null;
   pronunciation_findings?: Array<Record<string, any>>;
+  ai_summary?: AiAnalysisSummary | null;
   processing_time_sec: number;
   filename: string;
   silence_analysis?: SilenceAnalysisResult | null;
@@ -214,8 +252,26 @@ export interface QuantitativeErrorMetrics {
   mean_signed_difference: number | null;
   signed_differences: number[];
   unit: string;
+  sample_note?: string | null;
   status: 'valid' | 'unavailable';
   reason?: string | null;
+}
+
+export interface EventMatchingDetail {
+  event_id?: string;
+  match_type?: 'TP' | 'FP' | 'FN';
+  classification?: 'TP' | 'FP' | 'FN';
+  detected_start?: number | null;
+  detected_end?: number | null;
+  detected_duration?: number | null;
+  reference_start?: number | null;
+  reference_end?: number | null;
+  matched_ref_index?: number | null;
+  time_difference_sec?: number | null;
+  duration_difference_sec?: number | null;
+  temporal_distance_seconds?: number | null;
+  reason?: string;
+  explanation?: string;
 }
 
 export interface EventDetectionEvaluation {
@@ -226,6 +282,7 @@ export interface EventDetectionEvaluation {
   recall: number | null;
   f1_score: number | null;
   tolerance_seconds: number;
+  matching_details?: EventMatchingDetail[];
   status: 'valid' | 'undefined';
   reason?: string | null;
 }

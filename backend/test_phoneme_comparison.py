@@ -245,13 +245,15 @@ def test_per_formula_calculation():
 
 def test_per_empty_sequences():
     """Verifies edge cases where expected or predicted sequence is empty."""
-    # Both empty -> 0.0%
+    # Both empty -> 0.0%, status="empty_sequences"
     _, m1 = align_phoneme_sequences([], [])
     assert m1["phoneme_error_rate"] == 0.0
+    assert m1["status"] == "empty_sequences"
 
-    # Reference empty, predicted non-empty -> 100.0%
+    # Reference empty, predicted non-empty -> None (cannot compute PER without reference), status="reference_unavailable"
     _, m2 = align_phoneme_sequences([], ["k", "æ", "t"])
-    assert m2["phoneme_error_rate"] == 100.0
+    assert m2["phoneme_error_rate"] is None
+    assert m2["status"] == "reference_unavailable"
 
 
 # ============================================================================
