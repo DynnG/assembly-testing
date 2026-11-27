@@ -1,6 +1,8 @@
 export interface HealthResponse {
   status: string;
   api_key_configured: boolean;
+  gemini_api_key_configured?: boolean;
+  gemini_model?: string;
 }
 
 export interface TestConnectionResponse {
@@ -15,6 +17,10 @@ export interface WordMetadata {
   token_index?: number;
   text: string;
   word?: string;
+  target_word?: string | null;
+  recognized_word?: string | null;
+  speaking_mode?: 'prompted' | 'spontaneous';
+  intent_certainty?: 'prompt_verified' | 'candidate_inferred';
   start: number;
   end: number;
   start_ms?: number;
@@ -156,6 +162,8 @@ export interface TranscriptionResponse {
   };
   words: WordMetadata[];
   disfluencies_enabled: boolean;
+  speaking_mode?: 'prompted' | 'spontaneous';
+  prompt_target?: string | null;
   phoneme_analysis?: {
     enabled: boolean;
     model: string;
@@ -193,8 +201,10 @@ export interface WordAlignmentResult {
   total_errors: number;
   word_error_rate: number | null;
   word_error_rate_percent: number | null;
-  status: 'valid' | 'undefined';
+  status: 'valid' | 'undefined' | 'reference_unavailable' | 'recording_mismatch';
   reason?: string | null;
+  recording_id?: string | null;
+  reference_recording_id?: string | null;
   aligned_pairs: AlignedToken[];
   normalized_reference: string;
   normalized_hypothesis: string;
@@ -415,4 +425,224 @@ export interface TestSessionRecord {
   aligned_pairs: AlignedToken[];
   status: 'completed' | 'failed' | 'excluded';
   exclusion_reason?: string | null;
+}
+
+export type ProcessingStage =
+  | 'recording'
+  | 'session_ended'
+  | 'transcribing'
+  | 'analyzing_fluency'
+  | 'analyzing_pronunciation'
+  | 'validating_evidence'
+  | 'generating_feedback'
+  | 'completed'
+  | 'error';
+
+export interface ConversationTurn {
+  turn_id: string;
+  audio_blob?: Blob | null;
+  audio_url?: string | null;
+  audio_base64?: string | null;
+  duration_seconds: number;
+  speaker: 'learner';
+  transcript?: string;
+  words?: WordMetadata[];
+  prompt_target?: string;
+  speaking_mode?: 'prompted' | 'spontaneous';
+  detected_pauses?: SilencePauseEvent[];
+  recorded_at: string;
+}
+
+export interface PostConversationReport {
+  report_id: string;
+  session_id: string;
+  created_at: string;
+  preferred_accent: string;
+  section_a_transcription_and_timing: {
+    full_transcript: string;
+    turn_count: number;
+    turns: Array<{
+      turn_id: string;
+      speaker: string;
+      transcript: string;
+      duration_seconds: number;
+      word_count: number;
+      confidence?: number | null;
+    }>;
+    word_timestamps_count: number;
+    word_timestamps: Array<{
+      word: string;
+      start?: number;
+      end?: number;
+      confidence?: number;
+      turn_id?: string;
+    }>;
+    asr_average_confidence?: number | null;
+    transcription_limitations: string[];
+  };
+  section_b_fluency_analysis: {
+    speech_rate_wpm: number | null;
+    silent_pause_frequency: number | null;
+    pauses_per_minute: number | null;
+    mean_silent_pause_duration_seconds: number | null;
+    repetition_rate_percent: number | null;
+    total_response_interval_seconds: number;
+    total_recognized_words: number;
+    pause_count: number;
+    repetition_event_count: number;
+    turn_breakdown: any[];
+    measurement_protocol: string;
+  };
+  section_c_pronunciation_observations: {
+    raw_predictions?: Array<{
+      word: string;
+      start?: number;
+      end?: number;
+      raw_prediction: string;
+      tokens: string[];
+    }>;
+    candidate_differences: any[];
+    validated_observations: Array<{
+      word: string;
+      target_word?: string;
+      recognized_word?: string;
+      expected_phoneme: string;
+      observed_phonetic_evidence: string;
+      difference_type: string;
+      nature_of_difference: string;
+      recording_quality_limitation?: string;
+      audio_playback_reference?: string | null;
+      validation_status: string;
+      confidence_level?: string;
+      recommendation?: string;
+      practice_words?: string[];
+      notes?: string;
+    }>;
+    excluded_observations?: any[];
+    insufficient_evidence?: any[];
+    human_review_required?: any[];
+    total_findings_count: number;
+    grouped_by_word: Record<string, any[]>;
+    underlying_diagnostic_data?: Array<Record<string, any>>;
+    insufficient_evidence_message?: string | null;
+    learner_observations?: Array<{
+      word: string;
+      target_sound: string;
+      observed_sound: string;
+      layman_explanation: string;
+      practice_words?: string[];
+    }>;
+  };
+  section_d_evidence_and_quality_checks: {
+    insufficient_audio_segments: any[];
+    insufficient_audio_count: number;
+    uncertain_phoneme_predictions: any[];
+    uncertain_predictions_count: number;
+    asr_reliability_limitations: string[];
+    unvalidated_observations_count: number;
+  };
+  section_e_formative_feedback: {
+    evidence_supported_strengths: string[];
+    priority_practice_areas: string[];
+    actionable_recommendations: string[];
+  };
+  // Redesigned 7 learner-centric sections (Part 6)
+  section_a_speaking_session?: {
+    overall_recording_assessment: string;
+    asr_transcription_and_reliability: string;
+    full_transcript: string;
+    turn_count: number;
+    total_recognized_words: number;
+    total_response_interval_seconds: number;
+    asr_average_confidence?: number | null;
+    turns: any[];
+    transcription_limitations: string[];
+  };
+  section_b_fluency_measurements?: {
+    speech_rate_wpm: number | null;
+    silent_pause_frequency: number | null;
+    pauses_per_minute: number | null;
+    mean_silent_pause_duration_seconds: number | null;
+    repetition_rate_percent: number | null;
+    total_response_interval_seconds?: number;
+    total_recognized_words?: number;
+    pause_count?: number;
+    repetition_event_count?: number;
+    measurement_protocol?: string;
+    fluency_summary?: string;
+    fluency_observations?: string[];
+  };
+  section_d_recording_quality_and_evidence?: {
+    recording_quality_limitations: string[];
+    insufficient_audio_count: number;
+    insufficient_audio_segments?: any[];
+    unvalidated_observations_count: number;
+    candidate_differences_count?: number;
+    policy_note?: string;
+    asr_reliability_limitations?: string[];
+  };
+  section_e_what_you_did_well?: string[];
+  section_f_what_to_practice_next?: string[];
+  section_g_recommended_practice?: string[];
+  generation_method: string;
+}
+
+export interface StartDialogueResponse {
+  session_id: string;
+  turn_id: string;
+  response: string;
+  intent: string;
+  topic: string;
+  conversation_complete: boolean;
+}
+
+export interface RespondDialogueResponse {
+  session_id: string;
+  turn_id: string;
+  response: string;
+  intent: string;
+  topic: string;
+  conversation_complete: boolean;
+  transcribed_text?: string | null;
+}
+
+export interface DialogueMessage {
+  speaker: 'ai' | 'learner';
+  text: string;
+  turn_id?: string;
+  timestamp?: string;
+  topic?: string;
+  intent?: string;
+}
+
+export interface ConversationSessionRecord {
+  session_id: string;
+  timestamp: string;
+  speaking_mode: 'prompted' | 'spontaneous';
+  prompt_target?: string;
+  turn_count: number;
+  total_duration_seconds: number;
+  turns: ConversationTurn[];
+  report?: PostConversationReport | null;
+  status: 'completed' | 'processing' | 'failed';
+  error_message?: string;
+}
+
+export interface AnalyzeConversationSessionRequest {
+  session_id: string;
+  speaking_mode: 'prompted' | 'spontaneous';
+  prompt_target?: string;
+  preferred_accent?: string;
+  min_pause_duration_seconds?: number;
+  silence_threshold_db?: number;
+  turns: Array<{
+    turn_id: string;
+    audio_base64?: string | null;
+    transcript?: string;
+    words?: WordMetadata[];
+    duration_seconds?: number;
+    prompt_target?: string;
+    speaking_mode?: 'prompted' | 'spontaneous';
+    detected_pauses?: SilencePauseEvent[];
+  }>;
 }

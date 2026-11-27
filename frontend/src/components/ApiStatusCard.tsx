@@ -1,27 +1,42 @@
 import React from 'react';
-import { Activity, Key, CheckCircle2, XCircle, AlertTriangle, RefreshCw, Send } from 'lucide-react';
+import { Activity, Key, CheckCircle2, XCircle, AlertTriangle, RefreshCw, Send, Sparkles } from 'lucide-react';
 
 interface ApiStatusCardProps {
   backendOnline: boolean | null;
   apiKeyConfigured: boolean | null;
+  geminiConfigured?: boolean | null;
+  geminiModel?: string;
   onRefreshHealth: () => Promise<void>;
   onTestConnection: () => Promise<void>;
+  onTestGeminiConnection?: () => Promise<void>;
   isTesting: boolean;
+  isTestingGemini?: boolean;
   testResult: {
     success: boolean;
     message: string;
     error?: string;
     status_code?: number;
   } | null;
+  geminiTestResult?: {
+    success: boolean;
+    message: string;
+    model?: string;
+    error?: string;
+  } | null;
 }
 
 export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
   backendOnline,
   apiKeyConfigured,
+  geminiConfigured,
+  geminiModel = 'gemini-3.5-flash-lite',
   onRefreshHealth,
   onTestConnection,
+  onTestGeminiConnection,
   isTesting,
+  isTestingGemini = false,
   testResult,
+  geminiTestResult,
 }) => {
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg shadow-black/20">
@@ -31,9 +46,9 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
             <Activity className="w-5 h-5" />
           </div>
           <div>
-            <h2 className="text-base font-semibold text-white">API Connection & Status</h2>
+            <h2 className="text-base font-semibold text-white">API Connection & Services</h2>
             <p className="text-xs text-slate-400">
-              Verifies FastAPI backend reachability and AssemblyAI authentication
+              Verifies FastAPI backend, AssemblyAI ASR, and Gemini 3.5 Flash-Lite integration
             </p>
           </div>
         </div>
@@ -41,13 +56,34 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
         <div className="flex items-center gap-2">
           <button
             onClick={onRefreshHealth}
-            disabled={isTesting}
+            disabled={isTesting || isTestingGemini}
             title="Refresh backend status"
             className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors disabled:opacity-50 text-xs flex items-center gap-1.5"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Refresh</span>
           </button>
+
+          {onTestGeminiConnection && (
+            <button
+              onClick={onTestGeminiConnection}
+              disabled={isTestingGemini || backendOnline === false}
+              className="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-medium text-xs flex items-center gap-1.5 transition-all shadow-md shadow-indigo-950/40 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isTestingGemini ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  <span>Verifying Gemini...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                  <span>Test Gemini 3.5</span>
+                </>
+              )}
+            </button>
+          )}
+
           <button
             onClick={onTestConnection}
             disabled={isTesting || backendOnline === false}
@@ -56,12 +92,12 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
             {isTesting ? (
               <>
                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                <span>Verifying with AssemblyAI...</span>
+                <span>Verifying AssemblyAI...</span>
               </>
             ) : (
               <>
                 <Send className="w-3.5 h-3.5" />
-                <span>Test API Connection</span>
+                <span>Test AssemblyAI</span>
               </>
             )}
           </button>
@@ -69,7 +105,7 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
       </div>
 
       {/* Status Badges */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
         {/* Backend Status */}
         <div className="bg-slate-800/50 border border-slate-800 rounded-lg p-3.5 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -86,7 +122,7 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
               </span>
             ) : backendOnline ? (
               <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                <CheckCircle2 className="w-3.5 h-3.5" /> Connected
+                <CheckCircle2 className="w-3.5 h-3.5" /> Online
               </span>
             ) : (
               <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-rose-500/10 text-rose-400 border border-rose-500/30">
@@ -96,12 +132,38 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
           </div>
         </div>
 
+        {/* Gemini 3.5 Flash-Lite Key Status */}
+        <div className="bg-slate-800/50 border border-slate-800 rounded-lg p-3.5 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
+            <div>
+              <div className="text-xs font-medium text-slate-300">Gemini 3.5 Flash-Lite</div>
+              <div className="text-[11px] text-slate-500 font-mono">{geminiModel}</div>
+            </div>
+          </div>
+          <div>
+            {geminiConfigured === null ? (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-slate-800 text-slate-400 border border-slate-700">
+                <RefreshCw className="w-3 h-3 animate-spin" /> Checking
+              </span>
+            ) : geminiConfigured ? (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                <CheckCircle2 className="w-3.5 h-3.5" /> Configured
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-blue-500/10 text-blue-400 border border-blue-500/30" title="Deterministic rule-based expert engine active">
+                <CheckCircle2 className="w-3.5 h-3.5" /> Expert Fallback
+              </span>
+            )}
+          </div>
+        </div>
+
         {/* AssemblyAI Key Status */}
         <div className="bg-slate-800/50 border border-slate-800 rounded-lg p-3.5 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <Key className="w-4 h-4 text-cyan-400 shrink-0" />
+            <Key className="w-4 h-4 text-teal-400 shrink-0" />
             <div>
-              <div className="text-xs font-medium text-slate-300">AssemblyAI Configuration</div>
+              <div className="text-xs font-medium text-slate-300">AssemblyAI ASR</div>
               <div className="text-[11px] text-slate-500">backend/.env</div>
             </div>
           </div>
@@ -116,7 +178,7 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
               </span>
             ) : (
               <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30">
-                <AlertTriangle className="w-3.5 h-3.5" /> Missing API Key
+                <AlertTriangle className="w-3.5 h-3.5" /> Missing Key
               </span>
             )}
           </div>
@@ -136,37 +198,38 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
         </div>
       )}
 
-      {/* Missing Key Setup Prompt */}
-      {backendOnline && apiKeyConfigured === false && (
-        <div className="mt-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-start gap-2.5 text-xs text-amber-300">
-          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+      {/* Gemini Connection Test Result Banner */}
+      {geminiTestResult && (
+        <div
+          className={`mt-3 p-3.5 rounded-lg border text-xs flex items-start gap-2.5 ${
+            geminiTestResult.success
+              ? 'bg-indigo-500/10 border-indigo-500/30 text-indigo-300'
+              : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+          }`}
+        >
+          {geminiTestResult.success ? (
+            <CheckCircle2 className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          )}
           <div className="space-y-1">
-            <span className="font-semibold">AssemblyAI API Key Missing:</span>
-            <p className="text-amber-200/90">
-              To enable speech-to-text, create a file at <code className="font-mono bg-amber-950/60 px-1 py-0.5 rounded text-amber-200">backend/.env</code> with:
-            </p>
-            <code className="block font-mono bg-amber-950/60 text-amber-200 px-2 py-1 rounded border border-amber-800/40">
-              ASSEMBLYAI_API_KEY=your_actual_api_key_here
-            </code>
-            <p className="text-[11px] text-amber-300/80">
-              Get your key from the official AssemblyAI dashboard at{' '}
-              <a
-                href="https://www.assemblyai.com/app"
-                target="_blank"
-                rel="noreferrer"
-                className="underline hover:text-white"
-              >
-                https://www.assemblyai.com/app
-              </a>
-            </p>
+            <div className="font-semibold">
+              {geminiTestResult.success ? 'Gemini 3.5 Flash-Lite Connection Verified' : 'Gemini Status Notice'}
+            </div>
+            <div className="text-slate-200">{geminiTestResult.message}</div>
+            <div className="text-[11px] text-slate-400">
+              {geminiTestResult.success
+                ? `Successfully connected to Gemini API using model '${geminiTestResult.model || geminiModel}'. Backend proxy secure; key never exposed to client.`
+                : 'When GEMINI_API_KEY is not configured or offline, Articula automatically activates the deterministic expert phonetic engine.'}
+            </div>
           </div>
         </div>
       )}
 
-      {/* Connection Test Banner Result */}
+      {/* AssemblyAI Connection Test Banner Result */}
       {testResult && (
         <div
-          className={`mt-4 p-3.5 rounded-lg border text-xs flex items-start gap-2.5 ${
+          className={`mt-3 p-3.5 rounded-lg border text-xs flex items-start gap-2.5 ${
             testResult.success
               ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
               : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
@@ -179,13 +242,13 @@ export const ApiStatusCard: React.FC<ApiStatusCardProps> = ({
           )}
           <div className="space-y-1">
             <div className="font-semibold">
-              {testResult.success ? 'API Connection Verified' : 'API Connection Test Failed'}
+              {testResult.success ? 'AssemblyAI Connection Verified' : 'AssemblyAI Test Failed'}
             </div>
             <div className="text-slate-200">{testResult.message}</div>
             <div className="text-[11px] text-slate-400">
               {testResult.success
-                ? 'Minimal authenticated request to AssemblyAI (GET /v2/transcript?limit=1) succeeded. Ready for transcription.'
-                : 'Distinguished auth / network result: no audio was uploaded.'}
+                ? 'Authenticated request to AssemblyAI succeeded. Speech-to-text pipeline ready.'
+                : 'Check your ASSEMBLYAI_API_KEY in backend/.env.'}
             </div>
           </div>
         </div>

@@ -12,9 +12,12 @@ expert phonetic rule-based fallback when offline or without external API keys.
 
 import json
 import os
+import logging
 from typing import Any, Dict, List, Optional
 import httpx
 from phoneme_comparison import PHONEME_PROFILES, normalize_ipa_symbol
+
+logger = logging.getLogger("articula.ai_summary")
 
 
 def build_expert_rule_based_summary(
@@ -293,9 +296,10 @@ async def generate_llm_analysis_summary(
 
     # 1. Try Gemini API if key is present
     gemini_key = gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     if gemini_key and gemini_key.strip():
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key.strip()}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key.strip()}"
             body = {
                 "contents": [
                     {"parts": [{"text": f"{system_instruction}\n\n{prompt}"}]}
@@ -314,7 +318,7 @@ async def generate_llm_analysis_summary(
                         text_val = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                         parsed = json.loads(text_val)
                         if isinstance(parsed, dict) and "overall_summary" in parsed:
-                            parsed["generation_method"] = "gemini_1.5_flash"
+                            parsed["generation_method"] = gemini_model
                             parsed["evidence_traceability"] = fallback_summary["evidence_traceability"]
                             return parsed
         except Exception:
@@ -353,3 +357,450 @@ async def generate_llm_analysis_summary(
 
     # Default to expert rule-based generator
     return fallback_summary
+
+
+def build_post_conversation_report(
+    session_id: str,
+    turns_data: List[Dict[str, Any]],
+    session_fluency: Dict[str, Any],
+    all_pronunciation_findings: List[Dict[str, Any]],
+    all_words: List[Dict[str, Any]],
+    preferred_accent: str = "General English",
+) -> Dict[str, Any]:
+    """
+    Builds the formal 5-section post-conversation consolidated report (Section 7).
+
+    Guarantees & Constraints:
+    1. Section A: Transcription & Timing (learner speech only, timestamps, ASR reliability, limitations)
+    2. Section B: Fluency Analysis (speech rate, pause freq, mean pause dur, repetition rate; NO inter-turn silence)
+    3. Section C: Selected Pronunciation Observations (grouped by word & phoneme, evidence-constrained, playback ref)
+    4. Section D: Evidence and Quality Checks (insufficient audio, uncertain predictions, ASR limits)
+    5. Section E: Formative Feedback (strengths, priority areas, actionable recommendations grounded in evidence)
+    Strictly excludes grammar, vocabulary, task performance, CEFR, or broad proficiency scoring.
+    """
+    import datetime
+
+    # --- Section A: Transcription & Timing Information ---
+    full_transcript_parts = []
+    processed_turns = []
+    total_conf = 0.0
+    conf_count = 0
+    all_word_timestamps = []
+
+    for t in turns_data:
+        t_id = t.get("turn_id", "turn")
+        t_text = t.get("transcript", t.get("text", "")).strip()
+        t_dur = float(t.get("audio_duration", t.get("duration", 0.0)))
+        t_conf = t.get("confidence")
+        if t_text:
+            full_transcript_parts.append(t_text)
+        if t_conf is not None:
+            total_conf += float(t_conf)
+            conf_count += 1
+
+        t_words = t.get("words", [])
+        for w in t_words:
+            all_word_timestamps.append({
+                "word": w.get("word", w.get("text", "")),
+                "start": w.get("start"),
+                "end": w.get("end"),
+                "confidence": w.get("confidence", w.get("assembly_confidence")),
+                "turn_id": t_id,
+            })
+
+        processed_turns.append({
+            "turn_id": t_id,
+            "speaker": "learner",
+            "transcript": t_text,
+            "duration_seconds": round(t_dur, 2),
+            "word_count": len(t_words) or len(t_text.split()),
+            "confidence": round(t_conf, 3) if t_conf is not None else None,
+        })
+
+    avg_conf = round(total_conf / conf_count, 3) if conf_count > 0 else None
+    transcription_limitations = [
+        "AssemblyAI transcription operates on learner utterances; conversational AI prompt audio is strictly excluded.",
+        "ASR confidence indicates acoustic/language model decoding certainty for lexical words, not learner pronunciation accuracy.",
+        "Word timestamps are derived from ASR acoustic alignment and may reflect slight coarticulation boundary variance.",
+    ]
+
+    section_a = {
+        "full_transcript": " ".join(full_transcript_parts),
+        "turn_count": len(processed_turns),
+        "turns": processed_turns,
+        "word_timestamps_count": len(all_word_timestamps),
+        "word_timestamps": all_word_timestamps,
+        "asr_average_confidence": avg_conf,
+        "transcription_limitations": transcription_limitations,
+    }
+
+    # --- Section B: Fluency Analysis ---
+    section_b = {
+        "speech_rate_wpm": session_fluency.get("speech_rate_wpm"),
+        "silent_pause_frequency": session_fluency.get("pause_frequency"),
+        "pauses_per_minute": session_fluency.get("pauses_per_minute"),
+        "mean_silent_pause_duration_seconds": session_fluency.get("mean_pause_duration_seconds"),
+        "repetition_rate_percent": session_fluency.get("repetition_rate_percent"),
+        "total_response_interval_seconds": session_fluency.get("total_response_interval_seconds", 0.0),
+        "total_recognized_words": session_fluency.get("total_recognized_words", 0),
+        "pause_count": session_fluency.get("pause_count", 0),
+        "repetition_event_count": session_fluency.get("repetition_event_count", 0),
+        "turn_breakdown": session_fluency.get("turns", []),
+        "measurement_protocol": (
+            "Fluency metrics are calculated exclusively on learner response intervals. "
+            "Silence intervals between separate conversation turns are strictly excluded from within-response pause calculations."
+        ),
+    }
+
+    # --- Section C: Selected Pronunciation Observations ---
+    # Partition observations into the 6 explicit evidentiary categories:
+    # 1. Raw phoneme predictions
+    # 2. Candidate phoneme differences
+    # 3. Validated pronunciation observations
+    # 4. Excluded observations
+    # 5. Insufficient evidence
+    # 6. Human-review-required observations
+    # Plus: Preserved underlying diagnostic data for research evaluation & debugging
+    grouped_findings: Dict[str, List[Dict[str, Any]]] = {}
+    validated_obs = []
+    candidate_diffs = []
+    excluded_obs = []
+    insufficient_evidence_obs = []
+    human_review_obs = []
+    seen_obs_keys = set()
+
+    for f in all_pronunciation_findings:
+        w_text = f.get("word", "")
+        exp = f.get("expected_phoneme", "")
+        pred = f.get("predicted_phoneme", "")
+        stat = f.get("validation_status", "candidate_difference")
+        key = (w_text.lower(), exp, pred, f.get("difference_type"))
+
+        if key in seen_obs_keys:
+            continue
+        seen_obs_keys.add(key)
+
+        obs_item = {
+            "word": w_text,
+            "target_word": f.get("target_word", w_text),
+            "recognized_word": f.get("recognized_word", w_text),
+            "expected_phoneme": exp,
+            "observed_phonetic_evidence": pred,
+            "difference_type": f.get("difference_type", "substitution"),
+            "nature_of_difference": f.get("observed_characteristic", "phonetic_variation"),
+            "recording_quality_limitation": f.get("audio_quality_status", "normal"),
+            "audio_playback_reference": f.get("supporting_audio_clip"),
+            "validation_status": stat,
+            "confidence_level": f.get("confidence_level", "requires_validation"),
+            "recommendation": f.get("recommendation"),
+            "practice_words": f.get("practice_words", []),
+            "notes": f.get("notes"),
+        }
+
+        # Partition into the 4/5/6 categories
+        if stat == "validated_observation":
+            validated_obs.append(obs_item)
+        elif stat in ("excluded_observation", "analysis_unavailable"):
+            excluded_obs.append(obs_item)
+        elif stat in ("insufficient_acoustic_evidence", "insufficient_evidence"):
+            insufficient_evidence_obs.append(obs_item)
+        elif stat in ("human_review_required", "candidate_discrepancy_review_required"):
+            human_review_obs.append(obs_item)
+        else:
+            candidate_diffs.append(obs_item)
+
+        if w_text not in grouped_findings:
+            grouped_findings[w_text] = []
+        grouped_findings[w_text].append(obs_item)
+
+    # 1. Raw phoneme predictions
+    raw_predictions_list = [
+        {
+            "word": w.get("word", w.get("text", "")),
+            "start": w.get("start"),
+            "end": w.get("end"),
+            "raw_prediction": w.get("predicted_phonemes_raw") or w.get("predicted_phonemes_str") or w.get("phoneme_prediction", ""),
+            "tokens": w.get("predicted_phonemes") or w.get("phoneme_tokens") or [],
+        }
+        for w in all_words
+        if w.get("predicted_phonemes") or w.get("phoneme_tokens") or w.get("predicted_phonemes_str")
+    ]
+
+    # Underlying diagnostic dataset preserved for research evaluation and debugging
+    underlying_diagnostic_data = [
+        {
+            "word": w.get("word", w.get("text", "")),
+            "target_word": w.get("target_word"),
+            "recognized_word": w.get("recognized_word"),
+            "start_ms": w.get("start_ms", w.get("start")),
+            "end_ms": w.get("end_ms", w.get("end")),
+            "raw_duration_ms": w.get("raw_duration_ms", w.get("duration_ms")),
+            "padded_duration_ms": w.get("padded_duration_ms"),
+            "audio_quality_status": w.get("audio_quality_status", "normal"),
+            "segmentation_status": w.get("segmentation_status", "valid"),
+            "asr_confidence": w.get("assembly_confidence", w.get("confidence")),
+            "reference_source": w.get("reference_source"),
+            "expected_phonemes": w.get("expected_phonemes", []),
+            "predicted_phonemes": w.get("predicted_phonemes", []),
+            "alignment": w.get("alignment", []),
+            "phoneme_error_rate": w.get("phoneme_error_rate"),
+            "requires_human_review": w.get("requires_human_review", False),
+            "notes": w.get("segmentation_notes"),
+        }
+        for w in all_words
+    ]
+
+    section_c = {
+        "raw_predictions": raw_predictions_list,
+        "candidate_differences": candidate_diffs,
+        "validated_observations": validated_obs,
+        "excluded_observations": excluded_obs,
+        "insufficient_evidence": insufficient_evidence_obs,
+        "human_review_required": human_review_obs,
+        "total_findings_count": len(all_pronunciation_findings),
+        "grouped_by_word": grouped_findings,
+        "underlying_diagnostic_data": underlying_diagnostic_data,
+    }
+
+    # --- Section D: Evidence and Quality Checks ---
+    short_audio_tokens = [
+        {
+            "word": w.get("word", w.get("text")),
+            "duration_ms": w.get("duration_ms"),
+            "quality_status": w.get("audio_quality_status"),
+            "notes": w.get("segmentation_notes"),
+        }
+        for w in all_words
+        if w.get("audio_quality_status") not in (None, "normal", "valid")
+        or (w.get("duration_ms") is not None and w.get("duration_ms") < 80)
+    ]
+
+    uncertain_predictions = [
+        {
+            "word": c.get("word"),
+            "expected": c.get("expected_phoneme"),
+            "observed": c.get("observed_phonetic_evidence"),
+            "reason": c.get("notes"),
+        }
+        for c in candidate_diffs
+        if c.get("validation_status") != "validated_observation"
+    ]
+
+    section_d = {
+        "insufficient_audio_segments": short_audio_tokens[:10],
+        "insufficient_audio_count": len(short_audio_tokens),
+        "uncertain_phoneme_predictions": uncertain_predictions[:10],
+        "uncertain_predictions_count": len(uncertain_predictions),
+        "asr_reliability_limitations": [
+            "AssemblyAI confidence represents acoustic-lexical match probability, not phonological accuracy.",
+            "Words with low ASR confidence are flagged for manual review rather than penalized as pronunciation errors.",
+            "Whole audio processing was prioritized to reduce edge transient distortions.",
+        ],
+        "unvalidated_observations_count": len(candidate_diffs),
+    }
+
+    # --- Section E: Formative Feedback ---
+    strengths = []
+    if session_fluency.get("speech_rate_wpm") and session_fluency["speech_rate_wpm"] >= 90:
+        strengths.append(
+            f"Speech rate ({session_fluency['speech_rate_wpm']} WPM) reflects conversational speaking pace."
+        )
+    if session_fluency.get("repetition_rate_percent") is not None and session_fluency["repetition_rate_percent"] <= 5.0:
+        strengths.append(
+            f"Low repetition rate ({session_fluency['repetition_rate_percent']}%) indicates coherent phrase production."
+        )
+    if len(validated_obs) == 0:
+        strengths.append("Analyzed tokens exhibited strong concordance with reference phonetic baselines.")
+    else:
+        strengths.append(f"Successfully communicated across {len(processed_turns)} turns with intelligible pacing.")
+
+    priority_practice = []
+    for vo in validated_obs[:3]:
+        exp = vo.get("expected_phoneme")
+        pred = vo.get("observed_phonetic_evidence")
+        w = vo.get("word")
+        priority_practice.append(
+            f"Articulatory focus on target /{exp}/ (observed as [{pred}] in \"{w}\")."
+        )
+    if not priority_practice:
+        priority_practice.append(
+            "There was insufficient evidence to identify a reliable pronunciation concern. Continue practicing conversational rhythm and steady pacing."
+        )
+
+    recommendations = []
+    for vo in validated_obs[:3]:
+        recs = vo.get("practice_words", [])
+        if recs:
+            recommendations.append(f"Practice minimal pairs and target words: {', '.join(recs)}.")
+    if not recommendations:
+        recommendations.append(
+            "Engage in repeated conversational turns focusing on sustained phrasing and natural pausing."
+        )
+
+    section_e = {
+        "evidence_supported_strengths": strengths,
+        "priority_practice_areas": priority_practice,
+        "actionable_recommendations": recommendations,
+    }
+
+    # Add explicit insufficient evidence note on Section C if no validated observations
+    if len(validated_obs) == 0:
+        section_c["insufficient_evidence_message"] = (
+            "There was insufficient evidence to identify a reliable pronunciation concern."
+        )
+    else:
+        section_c["insufficient_evidence_message"] = None
+
+    # The 7 Learner-Centric Report Sections (Part 6)
+    section_a_speaking_session = {
+        "overall_recording_assessment": (
+            f"You completed {len(processed_turns)} conversational turn(s) with an active speaking time of "
+            f"{section_b['total_response_interval_seconds']:.1f} seconds across {section_b['total_recognized_words']} words."
+        ),
+        "asr_transcription_and_reliability": (
+            f"Transcribed {len(processed_turns)} turn(s) with {round((avg_conf or 0.9) * 100)}% average decoding reliability. "
+            "Note: ASR confidence reflects lexical decoding certainty, not learner pronunciation accuracy."
+        ),
+        "full_transcript": section_a["full_transcript"],
+        "turn_count": len(processed_turns),
+        "total_recognized_words": section_b["total_recognized_words"],
+        "total_response_interval_seconds": section_b["total_response_interval_seconds"],
+        "asr_average_confidence": avg_conf,
+        "turns": processed_turns,
+        "transcription_limitations": transcription_limitations,
+    }
+
+    section_b_fluency_measurements = {
+        "speech_rate_wpm": section_b["speech_rate_wpm"],
+        "silent_pause_frequency": section_b["silent_pause_frequency"],
+        "pauses_per_minute": section_b["pauses_per_minute"],
+        "mean_silent_pause_duration_seconds": section_b["mean_silent_pause_duration_seconds"],
+        "repetition_rate_percent": section_b["repetition_rate_percent"],
+        "total_response_interval_seconds": section_b["total_response_interval_seconds"],
+        "total_recognized_words": section_b["total_recognized_words"],
+        "pause_count": section_b["pause_count"],
+        "repetition_event_count": section_b["repetition_event_count"],
+        "measurement_protocol": section_b["measurement_protocol"],
+        "fluency_observations": [
+            f"Speaking pace: {section_b['speech_rate_wpm']} WPM across active speaking time.",
+            f"Silent pauses: {section_b['pause_count']} pause(s), averaging {section_b['mean_silent_pause_duration_seconds']}s each.",
+            f"Phrase repetition: {section_b['repetition_rate_percent']}% of words produced.",
+        ],
+    }
+
+    section_d_recording_quality_and_evidence = {
+        "recording_quality_limitations": section_d["asr_reliability_limitations"],
+        "insufficient_audio_count": section_d["insufficient_audio_count"],
+        "insufficient_audio_segments": section_d["insufficient_audio_segments"],
+        "unvalidated_observations_count": section_d["unvalidated_observations_count"],
+        "candidate_differences_count": len(candidate_diffs),
+        "policy_note": (
+            f"{len(candidate_diffs)} candidate difference(s) were observed in spontaneous speech. "
+            "Under Articula's strict evidence rules, candidate discrepancies require multi-utterance confirmation "
+            "and are not treated as confirmed learner errors."
+        ),
+    }
+
+    return {
+        "report_id": f"rep_{session_id}_{int(datetime.datetime.now().timestamp())}",
+        "session_id": session_id,
+        "created_at": datetime.datetime.now().isoformat(),
+        "preferred_accent": preferred_accent,
+        # Backward-compatible 5 section keys
+        "section_a_transcription_and_timing": section_a,
+        "section_b_fluency_analysis": section_b,
+        "section_c_pronunciation_observations": section_c,
+        "section_d_evidence_and_quality_checks": section_d,
+        "section_e_formative_feedback": section_e,
+        # Redesigned 7 learner-centric sections (Part 6)
+        "section_a_speaking_session": section_a_speaking_session,
+        "section_b_fluency_measurements": section_b_fluency_measurements,
+        "section_d_recording_quality_and_evidence": section_d_recording_quality_and_evidence,
+        "section_e_what_you_did_well": strengths,
+        "section_f_what_to_practice_next": priority_practice,
+        "section_g_recommended_practice": recommendations,
+        "generation_method": "deterministic_expert_rules",
+    }
+
+
+async def generate_post_conversation_feedback_llm(
+    session_report: Dict[str, Any],
+    gemini_api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Uses Gemini 3.5 Flash-Lite exclusively to interpret and organize structured assessment findings
+    into learner-friendly, accessible language.
+    STRICT CONSTRAINT: Gemini is NEVER permitted to invent measurements, phoneme predictions,
+    or errors not supported by session_report data.
+    """
+    try:
+        from gemini_service import GeminiService
+        service = GeminiService(api_key=gemini_api_key)
+
+        sec_a = session_report.get("section_a_transcription_and_timing", {})
+        sec_b = session_report.get("section_b_fluency_analysis", {})
+        sec_c = session_report.get("section_c_pronunciation_observations", {})
+        sec_d = session_report.get("section_d_evidence_and_quality_checks", {})
+
+        evidence_payload = {
+            "transcription_info": {
+                "full_transcript": sec_a.get("full_transcript", ""),
+                "turn_count": sec_a.get("turn_count", 0),
+                "total_recognized_words": sec_a.get("word_timestamps_count", 0),
+                "asr_average_confidence": sec_a.get("asr_average_confidence"),
+                "transcription_limitations": sec_a.get("transcription_limitations", []),
+            },
+            "fluency_measures": {
+                "speech_rate_wpm": sec_b.get("speech_rate_wpm"),
+                "silent_pause_frequency": sec_b.get("silent_pause_frequency"),
+                "mean_silent_pause_duration_seconds": sec_b.get("mean_silent_pause_duration_seconds"),
+                "repetition_rate_percent": sec_b.get("repetition_rate_percent"),
+                "total_response_interval_seconds": sec_b.get("total_response_interval_seconds", 0.0),
+                "pause_count": sec_b.get("pause_count", 0),
+                "repetition_event_count": sec_b.get("repetition_event_count", 0),
+            },
+            "validated_pronunciation_observations": sec_c.get("validated_observations", []),
+            "quality_and_limitations": {
+                "insufficient_audio_count": sec_d.get("insufficient_audio_count", 0),
+                "unvalidated_observations_count": sec_d.get("unvalidated_observations_count", 0),
+                "uncertain_predictions_count": sec_d.get("uncertain_predictions_count", 0),
+                "asr_limitations": sec_d.get("asr_reliability_limitations", []),
+            },
+        }
+
+        interpreted = await service.interpret_assessment_results(evidence_payload)
+
+        # Update Section E
+        session_report["section_e_formative_feedback"]["evidence_supported_strengths"] = interpreted.evidence_supported_strengths
+        session_report["section_e_formative_feedback"]["priority_practice_areas"] = interpreted.priority_practice_areas
+        session_report["section_e_formative_feedback"]["actionable_recommendations"] = interpreted.actionable_recommendations
+
+        # Update Redesigned 7 Learner Sections
+        if "section_a_speaking_session" in session_report:
+            session_report["section_a_speaking_session"]["overall_recording_assessment"] = interpreted.overall_recording_assessment
+            session_report["section_a_speaking_session"]["asr_transcription_and_reliability"] = interpreted.asr_transcription_and_reliability
+
+        if "section_b_fluency_measurements" in session_report:
+            session_report["section_b_fluency_measurements"]["fluency_summary"] = interpreted.fluency_measurements_summary
+            session_report["section_b_fluency_measurements"]["fluency_observations"] = interpreted.evidence_supported_fluency_observations
+
+        session_report["section_c_pronunciation_observations"]["learner_observations"] = [
+            item.model_dump() for item in interpreted.selected_pronunciation_observations
+        ]
+
+        if "section_d_recording_quality_and_evidence" in session_report:
+            session_report["section_d_recording_quality_and_evidence"]["recording_quality_limitations"] = interpreted.recording_quality_and_limitations
+
+        session_report["section_e_what_you_did_well"] = interpreted.evidence_supported_strengths
+        session_report["section_f_what_to_practice_next"] = interpreted.priority_practice_areas
+        session_report["section_g_recommended_practice"] = interpreted.actionable_recommendations
+
+        session_report["generation_method"] = (
+            f"{service.model} (structured_interpretation)" if service.is_configured() else "deterministic_expert_rules"
+        )
+    except Exception as exc:
+        logger.warning(f"Error during post-conversation LLM feedback interpretation: {exc}")
+
+    return session_report
+
+    return session_report

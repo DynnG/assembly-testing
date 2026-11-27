@@ -467,6 +467,8 @@ def build_unified_hybrid_result(
     words: List[Dict[str, Any]],
     raw_metadata: Optional[Dict[str, Any]] = None,
     preferred_accent: str = "General English",
+    speaking_mode: str = "prompted",
+    prompt_target: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Constructs the structured Stage 6 hybrid results payload preserving whole-response
@@ -494,6 +496,9 @@ def build_unified_hybrid_result(
             "words_with_findings": len([w for w in words if w.get("findings_count", 0) > 0]),
             "total_findings": len(all_findings),
             "accent_variety": preferred_accent,
+            "speaking_mode": speaking_mode,
+            "prompt_target": prompt_target,
+            "target_source": "prompt_target" if (speaking_mode == "prompted" and prompt_target) else "asr_candidate",
         },
         "pronunciation_findings": all_findings,
         "raw_metadata": raw_metadata or {},
@@ -509,6 +514,8 @@ def analyze_words_phonemes(
     full_transcription: str = "",
     return_unified: bool = False,
     preferred_accent: str = "General English",
+    speaking_mode: str = "prompted",
+    prompt_target: Optional[str] = None,
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Complete hybrid audio processing pipeline:
@@ -517,7 +524,9 @@ def analyze_words_phonemes(
     3. Resamples extracted word segments to 16 kHz mono.
     4. Runs batched Hugging Face Wav2Vec2Phoneme acoustic inference.
     5. Compares expected vs predicted phonemes, aligns sequences, and calculates Phoneme Error Rate (PER).
-    6. Produces structured evidence-based pronunciation findings for personalized feedback.
+       - In Prompted mode: Target word takes precedence as the verified reference.
+       - In Spontaneous mode: ASR word is treated as a candidate hypothesis, marked with appropriate uncertainty.
+    6. Produces structured evidence-based pronunciation findings for formative feedback.
     7. Combines whole-response context with word-level diagnostics into a unified structure.
 
     If return_unified=True: returns structured dict with recording_id, full_transcription, audio_metadata, words, and findings.
@@ -531,8 +540,16 @@ def analyze_words_phonemes(
                 audio_metadata={"duration": 0.0, "sample_rate": 16000, "channels": 1},
                 words=[],
                 preferred_accent=preferred_accent,
+                speaking_mode=speaking_mode,
+                prompt_target=prompt_target,
             )
         return []
+
+    prompt_words = (
+        [p.strip(".,!?;:\"'") for p in prompt_target.strip().split() if p.strip()]
+        if prompt_target
+        else []
+    )
 
     # 1. Decode original recording at native sample rate
     try:
@@ -542,12 +559,22 @@ def analyze_words_phonemes(
         error_words = []
         for idx, w in enumerate(words):
             raw_w = str(w.get("text", ""))
-            ref_res = _EXPECTED_GENERATOR.generate_expected(raw_w, preferred_accent=preferred_accent)
+            rec_w = raw_w
+            if speaking_mode == "prompted" and prompt_words:
+                target_w = prompt_words[0] if len(prompt_words) == 1 else (prompt_words[idx] if idx < len(prompt_words) else rec_w)
+            else:
+                target_w = rec_w
+
+            ref_res = _EXPECTED_GENERATOR.generate_expected(target_w, preferred_accent=preferred_accent)
             error_words.append({
                 "word_id": idx + 1,
                 "token_index": idx + 1,
-                "text": raw_w,
-                "word": raw_w,
+                "text": rec_w,
+                "word": target_w,
+                "target_word": target_w,
+                "recognized_word": rec_w,
+                "speaking_mode": speaking_mode,
+                "intent_certainty": "prompt_verified" if (speaking_mode == "prompted" and prompt_words) else "candidate_inferred",
                 "start_ms": w.get("start"),
                 "end_ms": w.get("end"),
                 "start": w.get("start"),
@@ -591,6 +618,8 @@ def analyze_words_phonemes(
                 audio_metadata={"duration": 0.0, "sample_rate": 16000, "channels": 1},
                 words=error_words,
                 preferred_accent=preferred_accent,
+                speaking_mode=speaking_mode,
+                prompt_target=prompt_target,
             )
         return error_words
 
@@ -607,17 +636,25 @@ def analyze_words_phonemes(
 
     for idx, w in enumerate(words):
         raw_text = str(w.get("text", "")).strip()
-        cleaned_text = raw_text.lower().strip(".,!?;:\"'")
+        rec_word = raw_text
+        if speaking_mode == "prompted" and prompt_words:
+            if len(prompt_words) == 1:
+                target_word = prompt_words[0]
+            elif idx < len(prompt_words):
+                target_word = prompt_words[idx]
+            else:
+                target_word = rec_word
+        else:
+            target_word = rec_word
+
         start_ms = w.get("start") if w.get("start") is not None else w.get("start_ms")
         end_ms = w.get("end") if w.get("end") is not None else w.get("end_ms")
         confidence = w.get("confidence") if w.get("confidence") is not None else w.get("assembly_confidence")
         speaker = w.get("speaker")
         clip_filename = f"word_{idx + 1:03d}.wav"
 
-        duration_ms = (end_ms - start_ms) if (start_ms is not None and end_ms is not None) else None
-
-        # Pre-resolve expected phonemes
-        ref_res = _EXPECTED_GENERATOR.generate_expected(raw_text, preferred_accent=preferred_accent)
+        # Pre-resolve expected phonemes from intended target word
+        ref_res = _EXPECTED_GENERATOR.generate_expected(target_word, preferred_accent=preferred_accent)
 
         slice_native, slice_16k, seg_status, quality_status, timing_dict, seg_notes = extract_word_segment(
             audio_native=audio_native,
@@ -639,13 +676,18 @@ def analyze_words_phonemes(
         record = {
             "word_id": idx + 1,
             "token_index": idx + 1,
-            "text": raw_text,
-            "word": raw_text,
+            "text": rec_word,
+            "word": target_word,
+            "target_word": target_word,
+            "recognized_word": rec_word,
+            "speaking_mode": speaking_mode,
+            "intent_certainty": "prompt_verified" if (speaking_mode == "prompted" and prompt_words) else "candidate_inferred",
             "start_ms": timing_dict["start_ms"],
             "end_ms": timing_dict["end_ms"],
             "start": timing_dict["start_ms"],
             "end": timing_dict["end_ms"],
             "duration_ms": timing_dict["raw_duration_ms"],
+            "raw_duration_ms": timing_dict["raw_duration_ms"],
             "padded_start_ms": timing_dict["padded_start_ms"],
             "padded_end_ms": timing_dict["padded_end_ms"],
             "padded_duration_ms": timing_dict["padded_duration_ms"],
@@ -689,7 +731,8 @@ def analyze_words_phonemes(
     # 4. Integrate phonetic predictions, perform sequence comparison, and generate findings
     for idx, (pred_str, tokens, err_note) in enumerate(predictions):
         rec = word_records[idx]
-        word_text = rec["word"]
+        target_w = rec["target_word"]
+        rec_w = rec["recognized_word"]
 
         if pred_str is not None and rec["audio_quality_status"] == "normal":
             rec["phoneme_prediction"] = pred_str
@@ -697,14 +740,20 @@ def analyze_words_phonemes(
             rec["analysis_status"] = "completed"
             rec["phoneme_analysis_status"] = "completed"
 
-            # Execute Expected vs Predicted Phoneme Comparison
+            # Execute Expected vs Predicted Phoneme Comparison against target word
             comparison = compare_word_phonemes(
-                word=word_text,
+                word=target_w,
                 predicted_tokens=tokens,
                 generator=_EXPECTED_GENERATOR,
                 assembly_confidence=rec["assembly_confidence"],
                 audio_clip=rec["audio_clip"],
                 preferred_accent=preferred_accent,
+                speaking_mode=speaking_mode,
+                target_word=target_w,
+                recognized_word=rec_w,
+                audio_quality_status=rec.get("audio_quality_status", "normal"),
+                duration_ms=rec.get("duration_ms"),
+                segmentation_status=rec.get("segmentation_status", "valid"),
             )
             rec["expected_phonemes"] = comparison["expected_phonemes"]
             rec["expected_phonemes_str"] = comparison["expected_phonemes_str"]
@@ -759,6 +808,8 @@ def analyze_words_phonemes(
             audio_metadata=audio_metadata,
             words=word_records,
             preferred_accent=preferred_accent,
+            speaking_mode=speaking_mode,
+            prompt_target=prompt_target,
         )
 
     return word_records

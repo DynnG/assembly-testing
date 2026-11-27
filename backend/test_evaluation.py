@@ -90,12 +90,12 @@ def test_wer_with_insertion():
 
 
 def test_wer_empty_reference():
-    """Empty reference must mark WER as undefined per thesis requirement."""
+    """Empty reference must mark WER as undefined / reference_unavailable per thesis requirement."""
     ref = ""
     hyp = "Something spoken"
     res = compute_word_alignment(ref, hyp)
 
-    assert res["status"] == "undefined"
+    assert res["status"] in ("undefined", "reference_unavailable")
     assert res["reference_word_count"] == 0
     assert res["word_error_rate"] is None
     assert res["word_error_rate_percent"] is None

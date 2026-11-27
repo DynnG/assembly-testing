@@ -47,13 +47,23 @@ def normalize_transcript(
 
 
 def compute_word_alignment(
-    reference_text: str,
+    reference_text: Optional[str],
     hypothesis_text: str,
     normalize: bool = True,
+    recording_id: Optional[str] = None,
+    reference_recording_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Computes exact word-level alignment between reference and hypothesis transcripts
     using the Wagner-Fischer dynamic programming algorithm.
+
+    Data Integrity Guarantees:
+    - Never reuses a reference transcript from another recording.
+    - If reference transcript is empty, missing, or whitespace, returns 'reference_unavailable'
+      with word_error_rate = None.
+    - If reference_recording_id is provided and does not match recording_id, returns
+      'recording_mismatch' with word_error_rate = None to prevent misleading WER.
+
     Returns:
     - substitution_count (S)
     - deletion_count (D)
@@ -63,11 +73,61 @@ def compute_word_alignment(
     - word_error_rate_percent (100 * WER)
     - aligned_pairs: List of token alignment operations
     """
-    ref_tokens = normalize_transcript(reference_text) if normalize else reference_text.split()
-    hyp_tokens = normalize_transcript(hypothesis_text) if normalize else hypothesis_text.split()
-
-    n = len(ref_tokens)
+    hyp_tokens = normalize_transcript(hypothesis_text) if normalize else (hypothesis_text.split() if hypothesis_text else [])
     m = len(hyp_tokens)
+
+    # 1. Guard against missing or empty reference transcript
+    if reference_text is None or not reference_text.strip():
+        return {
+            "reference_word_count": 0,
+            "recognized_word_count": m,
+            "substitution_count": 0,
+            "deletion_count": 0,
+            "insertion_count": m,
+            "total_errors": 0,
+            "word_error_rate": None,
+            "word_error_rate_percent": None,
+            "status": "reference_unavailable",
+            "reason": "Reference transcript contains no eligible words (N=0). Verified reference transcript is unavailable for this recording. Word Error Rate (WER) cannot be computed.",
+            "aligned_pairs": [],
+            "normalized_reference": "",
+            "normalized_hypothesis": " ".join(hyp_tokens),
+            "recording_id": recording_id,
+            "reference_recording_id": reference_recording_id,
+        }
+
+    # 2. Guard against cross-recording reference mismatch
+    if (
+        recording_id is not None
+        and reference_recording_id is not None
+        and recording_id.strip() != ""
+        and reference_recording_id.strip() != ""
+        and recording_id.strip() != reference_recording_id.strip()
+    ):
+        return {
+            "reference_word_count": 0,
+            "recognized_word_count": m,
+            "substitution_count": 0,
+            "deletion_count": 0,
+            "insertion_count": 0,
+            "total_errors": 0,
+            "word_error_rate": None,
+            "word_error_rate_percent": None,
+            "status": "recording_mismatch",
+            "reason": (
+                f"Reference transcript is annotated for recording '{reference_recording_id}', "
+                f"but current recording is '{recording_id}'. Cross-recording reference reuse is "
+                f"strictly prevented to avoid misleading WER evaluation."
+            ),
+            "aligned_pairs": [],
+            "normalized_reference": reference_text,
+            "normalized_hypothesis": " ".join(hyp_tokens),
+            "recording_id": recording_id,
+            "reference_recording_id": reference_recording_id,
+        }
+
+    ref_tokens = normalize_transcript(reference_text) if normalize else reference_text.split()
+    n = len(ref_tokens)
 
     # If reference has no eligible words, WER is undefined
     if n == 0:
@@ -77,15 +137,18 @@ def compute_word_alignment(
             "substitution_count": 0,
             "deletion_count": 0,
             "insertion_count": m,
+            "total_errors": m,
             "word_error_rate": None,
             "word_error_rate_percent": None,
             "status": "undefined",
-            "reason": "Reference transcript contains no eligible words (N=0).",
+            "reason": "Reference transcript contains no eligible words after normalization (N=0).",
             "aligned_pairs": [
                 {"type": "insertion", "ref_token": None, "hyp_token": tok} for tok in hyp_tokens
             ],
             "normalized_reference": " ".join(ref_tokens),
             "normalized_hypothesis": " ".join(hyp_tokens),
+            "recording_id": recording_id,
+            "reference_recording_id": reference_recording_id,
         }
 
     # DP Matrix: dp[i][j] = (cost, op, prev_i, prev_j)
@@ -188,6 +251,8 @@ def compute_word_alignment(
         "aligned_pairs": aligned_pairs,
         "normalized_reference": " ".join(ref_tokens),
         "normalized_hypothesis": " ".join(hyp_tokens),
+        "recording_id": recording_id,
+        "reference_recording_id": reference_recording_id,
     }
 
 
@@ -587,4 +652,125 @@ def evaluate_event_detection(
         "matching_details": matching_details,
         "status": "valid" if (precision is not None or recall is not None) else "undefined",
         "reason": None if (precision is not None and recall is not None) else "Zero in denominator.",
+    }
+
+
+def compute_session_fluency(
+    turn_metrics: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Computes session-level aggregated fluency measurements across all learner turns.
+
+    Research & Thesis Protocol Guarantees:
+    1. Calculations use ONLY learner active response intervals.
+    2. Silence between separate conversation turns is strictly excluded from within-response pause calculations.
+    3. Preserves individual-turn measurements alongside the aggregated session results.
+    4. Evaluates the 4 defined thesis fluency measures:
+       A. Speech rate (WPM) = 60 * Total Words / Total Active Duration
+       B. Silent-pause frequency = Total Pauses / Total Active Duration (and Pauses per Minute = 60 * P / T)
+       C. Mean silent-pause duration = Total Pause Duration / Total Pauses
+       D. Repetition rate = 100 * Total Repetitions / Total Words
+    """
+    if not turn_metrics:
+        return {
+            "turn_count": 0,
+            "total_recognized_words": 0,
+            "total_response_interval_seconds": 0.0,
+            "speech_rate_wpm": None,
+            "pause_count": 0,
+            "total_pause_duration_seconds": 0.0,
+            "mean_pause_duration_seconds": None,
+            "pause_frequency": None,
+            "pauses_per_minute": None,
+            "repetition_event_count": 0,
+            "repetition_rate_percent": None,
+            "turns": [],
+            "status": "unavailable",
+            "reason": "No conversation turns provided for session fluency aggregation.",
+        }
+
+    total_words = 0
+    total_active_duration = 0.0
+    total_pause_count = 0
+    total_pause_duration = 0.0
+    total_repetitions = 0
+    processed_turns = []
+
+    for t in turn_metrics:
+        turn_id = t.get("turn_id", f"turn_{len(processed_turns) + 1}")
+        w_count = int(t.get("word_count", 0))
+        resp_dur = float(t.get("response_interval_seconds", 0.0))
+        pauses = t.get("pause_events", [])
+        p_count = len(pauses) if isinstance(pauses, list) else int(t.get("pause_count", 0))
+        p_dur = sum(float(p.get("duration_seconds", 0.0)) for p in pauses) if isinstance(pauses, list) else float(t.get("total_pause_duration_seconds", 0.0))
+        rep_count = int(t.get("repetition_count", 0))
+
+        total_words += w_count
+        total_active_duration += resp_dur
+        total_pause_count += p_count
+        total_pause_duration += p_dur
+        total_repetitions += rep_count
+
+        turn_wpm = round((60.0 * w_count) / resp_dur, 2) if (resp_dur > 0 and w_count > 0) else None
+        turn_mean_pause = round(p_dur / p_count, 3) if p_count > 0 else None
+        turn_pause_freq = round(p_count / resp_dur, 3) if resp_dur > 0 else None
+        turn_rep_rate = round((100.0 * rep_count) / w_count, 2) if w_count > 0 else None
+
+        processed_turns.append({
+            "turn_id": turn_id,
+            "word_count": w_count,
+            "response_interval_seconds": round(resp_dur, 3),
+            "speech_rate_wpm": turn_wpm,
+            "pause_count": p_count,
+            "total_pause_duration_seconds": round(p_dur, 3),
+            "mean_pause_duration_seconds": turn_mean_pause,
+            "pause_frequency": turn_pause_freq,
+            "repetition_count": rep_count,
+            "repetition_rate_percent": turn_rep_rate,
+        })
+
+    total_active_duration = round(total_active_duration, 3)
+    total_pause_duration = round(total_pause_duration, 3)
+
+    session_wpm = (
+        round((60.0 * total_words) / total_active_duration, 2)
+        if (total_active_duration > 0 and total_words > 0)
+        else None
+    )
+    session_mean_pause = (
+        round(total_pause_duration / total_pause_count, 3)
+        if total_pause_count > 0
+        else None
+    )
+    session_pause_freq = (
+        round(total_pause_count / total_active_duration, 3)
+        if total_active_duration > 0
+        else None
+    )
+    session_pauses_per_min = (
+        round((60.0 * total_pause_count) / total_active_duration, 2)
+        if total_active_duration > 0
+        else None
+    )
+    session_rep_rate = (
+        round((100.0 * total_repetitions) / total_words, 2)
+        if total_words > 0
+        else None
+    )
+
+    return {
+        "turn_count": len(processed_turns),
+        "total_recognized_words": total_words,
+        "total_response_interval_seconds": total_active_duration,
+        "speech_rate_wpm": session_wpm,
+        "pause_count": total_pause_count,
+        "total_pause_duration_seconds": total_pause_duration,
+        "mean_pause_duration_seconds": session_mean_pause,
+        "pause_frequency": session_pause_freq,
+        "pauses_per_minute": session_pauses_per_min,
+        "repetition_event_count": total_repetitions,
+        "repetition_rate_percent": session_rep_rate,
+        "turns": processed_turns,
+        "status": "valid",
+        "reason": None,
     }

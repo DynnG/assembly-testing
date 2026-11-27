@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import time
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -22,6 +23,7 @@ from evaluation import (
     compute_quantitative_errors,
     evaluate_event_detection,
     normalize_transcript,
+    compute_session_fluency,
 )
 from silence_detector import detect_silence_in_wav
 from phoneme_analyzer import analyze_words_phonemes, CANONICAL_IPA_REFERENCE
@@ -38,7 +40,16 @@ from export_service import (
 from ai_summary_service import (
     build_expert_rule_based_summary,
     generate_llm_analysis_summary,
+    build_post_conversation_report,
+    generate_post_conversation_feedback_llm,
 )
+from gemini_service import (
+    GeminiService,
+    ConversationalResponseModel,
+    PostAssessmentInterpretationModel,
+)
+
+logger = logging.getLogger("articula.main")
 
 # Reference pronunciation generator singleton for API endpoints
 _MAIN_EXPECTED_GENERATOR = ExpectedPhonemeGenerator(canonical_overrides=CANONICAL_IPA_REFERENCE)
@@ -93,14 +104,56 @@ def get_api_key() -> Optional[str]:
 @app.get("/health", summary="Check backend health and API key presence")
 def health_check():
     """
-    Returns backend health status and indicates whether the AssemblyAI
-    API key is configured in the environment, without exposing the key value.
+    Returns backend health status and indicates whether the AssemblyAI and Gemini
+    API keys are configured in the environment, without exposing the key values.
     """
     key = get_api_key()
+    gemini_svc = GeminiService()
     return {
         "status": "ok",
         "api_key_configured": bool(key),
+        "gemini_api_key_configured": gemini_svc.is_configured(),
+        "gemini_model": gemini_svc.model,
     }
+
+
+@app.post("/test-gemini-connection", summary="Test Gemini API connection and authentication")
+async def test_gemini_connection():
+    """
+    Verifies that the Gemini API key is configured and can communicate with
+    the official Gemini model (gemini-3.5-flash-lite) securely through the backend.
+    """
+    gemini_svc = GeminiService()
+    if not gemini_svc.is_configured():
+        return {
+            "success": False,
+            "error": "missing_api_key",
+            "message": "GEMINI_API_KEY is not configured in backend/.env. Using deterministic expert fallback.",
+        }
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_svc.model}:generateContent?key={gemini_svc.api_key.strip()}"
+        body = {
+            "contents": [{"parts": [{"text": "Hello"}]}],
+            "generationConfig": {"maxOutputTokens": 5},
+        }
+        raw_res = await gemini_svc._post_with_retry(url, body)
+        if raw_res:
+            return {
+                "success": True,
+                "message": f"Successfully connected to Gemini API using model '{gemini_svc.model}'.",
+                "model": gemini_svc.model,
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Gemini API request failed or timed out. Check your GEMINI_API_KEY in backend/.env.",
+            }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "message": f"Gemini connection error: {str(exc)}",
+        }
 
 
 @app.post("/test-connection", summary="Test AssemblyAI API connection and authentication")
@@ -211,6 +264,9 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     disfluencies: bool = Form(True),
     phoneme_analysis: bool = Form(True),
+    speaking_mode: str = Form("prompted"),
+    prompt_target: Optional[str] = Form(None),
+    recording_id: Optional[str] = Form(None),
 ):
     """
     Accepts an audio file, streams it directly to AssemblyAI's upload endpoint,
@@ -474,6 +530,8 @@ async def transcribe_audio(
         "channels": 1,
     }
 
+    eff_recording_id = recording_id or transcript_id
+
     # Integrate Hugging Face Wav2Vec2Phoneme for pronunciation characteristic analysis
     if phoneme_analysis and cleaned_words:
         try:
@@ -482,9 +540,11 @@ async def transcribe_audio(
                 words=cleaned_words,
                 filename=filename,
                 padding_ms=25,
-                recording_id=transcript_id,
+                recording_id=eff_recording_id,
                 full_transcription=full_text,
                 return_unified=True,
+                speaking_mode=speaking_mode,
+                prompt_target=prompt_target,
             )
             cleaned_words = hybrid_result.get("words", cleaned_words)
             if hybrid_result.get("audio_metadata"):
@@ -518,7 +578,9 @@ async def transcribe_audio(
     return {
         "success": True,
         "id": transcript_id,
-        "recording_id": transcript_id,
+        "recording_id": eff_recording_id,
+        "speaking_mode": speaking_mode,
+        "prompt_target": prompt_target,
         "status": completed_data.get("status"),
         "text": full_text,
         "full_transcription": full_text,
@@ -602,6 +664,9 @@ class ComparePhonemesRequest(BaseModel):
     preferred_accent: Optional[str] = Field("General English", description="Reference accent variety (e.g. General English, US, UK)")
     assembly_confidence: Optional[float] = Field(None, description="Optional ASR word confidence score")
     audio_clip: Optional[str] = Field(None, description="Optional supporting audio clip filename")
+    speaking_mode: Optional[str] = Field("prompted", description="Speaking mode: 'prompted' or 'spontaneous'")
+    target_word: Optional[str] = Field(None, description="Intended prompt target word")
+    recognized_word: Optional[str] = Field(None, description="Recognized ASR word")
 
 
 @app.post("/compare-phonemes", summary="Compare expected reference phonemes vs predicted phonemes for a word")
@@ -621,7 +686,8 @@ def compare_phonemes_endpoint(req: ComparePhonemesRequest):
     # If manual expected override is provided, register temporary generator override
     if req.expected_phonemes:
         exp_tokens = tokenize_phoneme_sequence(req.expected_phonemes)
-        custom_gen = ExpectedPhonemeGenerator(canonical_overrides={req.word.lower().strip(): " ".join(exp_tokens)})
+        target_lookup = (req.target_word or req.word).lower().strip()
+        custom_gen = ExpectedPhonemeGenerator(canonical_overrides={target_lookup: " ".join(exp_tokens)})
         generator_to_use = custom_gen
     else:
         generator_to_use = _MAIN_EXPECTED_GENERATOR
@@ -633,6 +699,9 @@ def compare_phonemes_endpoint(req: ComparePhonemesRequest):
         assembly_confidence=req.assembly_confidence,
         audio_clip=req.audio_clip,
         preferred_accent=req.preferred_accent or "General English",
+        speaking_mode=req.speaking_mode or "prompted",
+        target_word=req.target_word,
+        recognized_word=req.recognized_word,
     )
 
     return {
@@ -665,8 +734,10 @@ async def analyze_silence_endpoint(
 
 
 class EvaluationRequest(BaseModel):
-    reference_transcript: str = Field(..., description="Manually verified reference transcript")
+    reference_transcript: Optional[str] = Field(None, description="Manually verified reference transcript belonging specifically to this recording")
     assemblyai_transcript: str = Field(..., description="Raw verbatim AssemblyAI transcript")
+    recording_id: Optional[str] = Field(None, description="Identifier for the current recording/session")
+    reference_recording_id: Optional[str] = Field(None, description="Identifier of the recording for which the reference was verified")
     audio_duration_seconds: float = Field(..., description="Audio duration in seconds")
     response_interval_seconds: Optional[float] = Field(None, description="Learner response interval T in seconds")
     detected_pauses: Optional[list] = Field(default_factory=list, description="Detected silence pause events")
@@ -692,11 +763,13 @@ def evaluate_endpoint(req: EvaluationRequest):
     - Quantitative Errors: MAE, Median Absolute Error, Signed Differences
     - Event-Detection Evaluation: Precision, Recall, F1 for pauses and repetitions
     """
-    # 1. Word Error Rate (WER) & Alignment
+    # 1. Word Error Rate (WER) & Alignment (Data Integrity: checks recording/session matching)
     alignment = compute_word_alignment(
         reference_text=req.reference_transcript,
         hypothesis_text=req.assemblyai_transcript,
         normalize=req.normalize if req.normalize is not None else True,
+        recording_id=req.recording_id,
+        reference_recording_id=req.reference_recording_id,
     )
 
     # 2. Speech Rate (WPM = 60 * W / T)
@@ -893,5 +966,526 @@ def export_report_endpoint(req: ExportDataRequest):
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ============================================================================
+# Phase 10: Conversation-First Architecture & Post-Conversation Assessment
+# ============================================================================
+
+async def execute_assemblyai_transcription(
+    audio_content: bytes,
+    api_key: str,
+    disfluencies: bool = True,
+    timeout_seconds: float = 120.0,
+) -> Dict[str, Any]:
+    """
+    Direct asynchronous wrapper for AssemblyAI STT.
+    Uploads audio bytes, requests transcription, and polls until completed.
+    """
+    headers = {"Authorization": api_key}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # 1. Upload audio
+        upload_resp = await client.post(
+            f"{ASSEMBLYAI_BASE_URL}/upload",
+            headers=headers,
+            content=audio_content,
+        )
+        if upload_resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"AssemblyAI upload failed: {upload_resp.text[:200]}",
+            )
+        upload_url = upload_resp.json().get("upload_url")
+
+        # 2. Submit transcript
+        transcript_resp = await client.post(
+            f"{ASSEMBLYAI_BASE_URL}/transcript",
+            headers={"Authorization": api_key, "Content-Type": "application/json"},
+            json={"audio_url": upload_url, "disfluencies": disfluencies},
+        )
+        if transcript_resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"AssemblyAI transcript submission failed: {transcript_resp.text[:200]}",
+            )
+        transcript_id = transcript_resp.json().get("id")
+
+        # 3. Poll for completion
+        poll_url = f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}"
+        poll_start = time.time()
+        while (time.time() - poll_start) < timeout_seconds:
+            poll_resp = await client.get(poll_url, headers=headers)
+            if poll_resp.status_code == 200:
+                res = poll_resp.json()
+                if res.get("status") == "completed":
+                    return res
+                elif res.get("status") == "error":
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=f"AssemblyAI transcription error: {res.get('error')}",
+                    )
+            await asyncio.sleep(1.2)
+
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"AssemblyAI transcription timed out after {timeout_seconds}s.",
+        )
+
+
+class ConversationTurnInput(BaseModel):
+    turn_id: str = Field(..., description="Unique turn identifier, e.g. turn_1")
+    audio_base64: Optional[str] = Field(None, description="Data URI or base64-encoded audio bytes")
+    transcript: Optional[str] = Field(None, description="Recognized or provided text")
+    words: Optional[List[Dict[str, Any]]] = Field(None, description="Word timestamps and confidence")
+    duration_seconds: Optional[float] = Field(None, description="Turn duration in seconds")
+    prompt_target: Optional[str] = Field(None, description="Prompt target word if prompted mode")
+    speaking_mode: Optional[str] = Field("prompted", description="'prompted' or 'spontaneous'")
+    detected_pauses: Optional[List[Dict[str, Any]]] = Field(None, description="Pre-calculated pause events")
+
+
+class AnalyzeConversationSessionRequest(BaseModel):
+    session_id: str = Field(..., description="Unique conversation session identifier")
+    speaking_mode: str = Field("prompted", description="'prompted' or 'spontaneous'")
+    prompt_target: Optional[str] = Field(None, description="Default prompt target word")
+    preferred_accent: str = Field("General English", description="Preferred English accent baseline")
+    min_pause_duration_seconds: float = Field(0.25, description="Minimum pause duration threshold")
+    silence_threshold_db: float = Field(-35.0, description="Silence energy threshold dBFS")
+    turns: List[ConversationTurnInput] = Field(..., description="Recorded learner conversation turns")
+
+
+async def run_post_conversation_pipeline(
+    session_id: str,
+    speaking_mode: str,
+    prompt_target: Optional[str],
+    preferred_accent: str,
+    turns_input: List[ConversationTurnInput],
+    min_pause: float = 0.25,
+    silence_db: float = -35.0,
+    progress_callback=None,
+) -> Dict[str, Any]:
+    """
+    Executes the post-conversation assessment pipeline sequentially through actual backend stages:
+    1. Transcribing (AssemblyAI STT for all turns lacking pre-computed transcripts)
+    2. Analyzing Fluency (calculates turn and aggregated session metrics, excluding inter-turn gaps)
+    3. Analyzing Pronunciation (runs Wav2Vec2 on original turn audio segments)
+    4. Validating Evidence (filters, deduplicates, and groups findings into 6 evidence categories)
+    5. Generating Feedback (compiles consolidated 5-section report)
+    6. Completed
+    """
+    import base64
+
+    # Stage 1: Transcribing
+    if progress_callback:
+        await progress_callback("transcribing", "Transcribing learner turns...", 20)
+
+    api_key = get_api_key()
+    processed_turns = []
+
+    for t_idx, turn in enumerate(turns_input):
+        t_id = turn.turn_id
+        t_text = turn.transcript
+        t_words = turn.words or []
+        t_dur = turn.duration_seconds
+        t_conf = None
+        t_audio_bytes = None
+
+        if turn.audio_base64:
+            b64_clean = turn.audio_base64.split(",")[-1] if "," in turn.audio_base64 else turn.audio_base64
+            try:
+                t_audio_bytes = base64.b64decode(b64_clean)
+            except Exception:
+                t_audio_bytes = None
+
+        # If transcript not provided and audio bytes exist, call AssemblyAI
+        if (not t_text or not t_words) and t_audio_bytes and api_key:
+            try:
+                stt_res = await execute_assemblyai_transcription(t_audio_bytes, api_key)
+                t_text = stt_res.get("text", "")
+                t_dur = stt_res.get("audio_duration") or t_dur
+                t_conf = stt_res.get("confidence")
+                t_words = [
+                    {
+                        "word": w.get("text"),
+                        "text": w.get("text"),
+                        "start": w.get("start"),
+                        "end": w.get("end"),
+                        "confidence": w.get("confidence"),
+                        "speaker": "learner",
+                    }
+                    for w in stt_res.get("words", [])
+                ]
+            except Exception as e:
+                # Fallback to empty text with error note
+                t_text = t_text or ""
+
+        if t_dur is None or t_dur <= 0:
+            if t_audio_bytes:
+                try:
+                    _, native_sr, _, dur = decode_audio_native(t_audio_bytes)
+                    t_dur = dur
+                except Exception:
+                    t_dur = 1.0
+            else:
+                t_dur = 1.0
+
+        processed_turns.append({
+            "turn_id": t_id,
+            "transcript": t_text or "",
+            "words": t_words,
+            "duration_seconds": t_dur,
+            "confidence": t_conf,
+            "audio_bytes": t_audio_bytes,
+            "prompt_target": turn.prompt_target or prompt_target,
+            "speaking_mode": turn.speaking_mode or speaking_mode,
+            "detected_pauses": turn.detected_pauses,
+        })
+
+    # Stage 2: Analyzing Fluency
+    if progress_callback:
+        await progress_callback("analyzing_fluency", "Analyzing turn and session fluency...", 40)
+
+    turn_fluency_metrics = []
+    for pt in processed_turns:
+        t_words = pt["words"]
+        t_text = pt["transcript"]
+        t_dur = pt["duration_seconds"]
+
+        # Detect pauses within turn if audio is WAV or if pauses were pre-computed
+        pauses = pt.get("detected_pauses") or []
+        if not pauses and pt.get("audio_bytes"):
+            try:
+                silence_res = detect_silence_in_wav(
+                    pt["audio_bytes"],
+                    min_pause_duration_seconds=min_pause,
+                    silence_threshold_db=silence_db,
+                )
+                if silence_res.get("status") == "valid":
+                    pauses = silence_res.get("detected_pauses", [])
+            except Exception:
+                pauses = []
+
+        tokens = normalize_transcript(t_text) if t_text else [w.get("text", "") for w in t_words]
+        reps = detect_candidate_repetitions(tokens)
+
+        w_count = len(t_words) if t_words else len(tokens)
+        turn_fluency_metrics.append({
+            "turn_id": pt["turn_id"],
+            "word_count": w_count,
+            "response_interval_seconds": t_dur,
+            "pause_events": pauses,
+            "pause_count": len(pauses),
+            "total_pause_duration_seconds": sum(float(p.get("duration_seconds", 0.0)) for p in pauses),
+            "repetition_count": len(reps),
+        })
+
+    session_fluency = compute_session_fluency(turn_fluency_metrics)
+
+    # Stage 3: Analyzing Pronunciation
+    if progress_callback:
+        await progress_callback("analyzing_pronunciation", "Extracting acoustic phoneme evidence...", 60)
+
+    all_analyzed_words = []
+    all_findings = []
+
+    for pt in processed_turns:
+        t_audio_bytes = pt.get("audio_bytes")
+        t_words = pt.get("words", [])
+        t_mode = pt.get("speaking_mode", speaking_mode)
+        t_target = pt.get("prompt_target", prompt_target)
+
+        if t_audio_bytes and t_words:
+            try:
+                analyzed = analyze_words_phonemes(
+                    audio_bytes=t_audio_bytes,
+                    words=t_words,
+                    filename=f"{pt['turn_id']}.wav",
+                    preferred_accent=preferred_accent,
+                    speaking_mode=t_mode,
+                    prompt_target=t_target,
+                )
+                all_analyzed_words.extend(analyzed)
+                for w in analyzed:
+                    if w.get("pronunciation_findings"):
+                        all_findings.extend(w["pronunciation_findings"])
+            except Exception:
+                # If phonetic inference fails on this turn, preserve words
+                all_analyzed_words.extend(t_words)
+        else:
+            all_analyzed_words.extend(t_words)
+
+    # Stage 4: Validating Evidence
+    if progress_callback:
+        await progress_callback("validating_evidence", "Filtering and validating phonetic evidence...", 80)
+
+    # Deduplicate findings by (word, expected, predicted)
+    seen_dedup = set()
+    validated_findings = []
+    for f in all_findings:
+        k = (f.get("word", "").lower(), f.get("expected_phoneme"), f.get("predicted_phoneme"), f.get("difference_type"))
+        if k not in seen_dedup:
+            seen_dedup.add(k)
+            validated_findings.append(f)
+
+    # Stage 5: Generating Feedback
+    if progress_callback:
+        await progress_callback("generating_feedback", "Generating post-conversation feedback report...", 95)
+
+    session_report = build_post_conversation_report(
+        session_id=session_id,
+        turns_data=processed_turns,
+        session_fluency=session_fluency,
+        all_pronunciation_findings=validated_findings,
+        all_words=all_analyzed_words,
+        preferred_accent=preferred_accent,
+    )
+
+    # Enhance formative feedback via Gemini if configured
+    session_report = await generate_post_conversation_feedback_llm(session_report)
+
+    # Stage 6: Completed
+    if progress_callback:
+        await progress_callback("completed", "Post-conversation assessment completed.", 100)
+
+    return session_report
+
+
+@app.post("/conversation/analyze-session", summary="Analyze completed multi-turn conversation session")
+async def analyze_conversation_session_endpoint(req: AnalyzeConversationSessionRequest):
+    """
+    Processes all learner turns collected during a conversation session.
+    Runs non-blocking post-conversation assessment across the sequential stages:
+    Transcribing -> Analyzing Fluency -> Analyzing Pronunciation -> Validating Evidence -> Generating Feedback -> Completed.
+    """
+    report = await run_post_conversation_pipeline(
+        session_id=req.session_id,
+        speaking_mode=req.speaking_mode,
+        prompt_target=req.prompt_target,
+        preferred_accent=req.preferred_accent,
+        turns_input=req.turns,
+        min_pause=req.min_pause_duration_seconds,
+        silence_db=req.silence_threshold_db,
+    )
+    return {
+        "success": True,
+        "session_id": req.session_id,
+        "report": report,
+    }
+
+
+@app.post("/conversation/analyze-session-stream", summary="Stream real progress events for post-conversation assessment")
+async def analyze_conversation_session_stream_endpoint(req: AnalyzeConversationSessionRequest):
+    """
+    Server-Sent Events (SSE) endpoint that streams real backend stage progress:
+    Recording -> Session Ended -> Transcribing -> Analyzing Fluency -> Analyzing Pronunciation -> Validating Evidence -> Generating Feedback -> Completed.
+    """
+    import json
+
+    async def event_generator():
+        progress_queue = asyncio.Queue()
+
+        async def callback(stage: str, message: str, progress: int):
+            await progress_queue.put({"stage": stage, "message": message, "progress": progress})
+
+        async def worker():
+            try:
+                rep = await run_post_conversation_pipeline(
+                    session_id=req.session_id,
+                    speaking_mode=req.speaking_mode,
+                    prompt_target=req.prompt_target,
+                    preferred_accent=req.preferred_accent,
+                    turns_input=req.turns,
+                    min_pause=req.min_pause_duration_seconds,
+                    silence_db=req.silence_threshold_db,
+                    progress_callback=callback,
+                )
+                await progress_queue.put({"stage": "completed", "message": "Assessment completed.", "progress": 100, "report": rep})
+            except Exception as exc:
+                await progress_queue.put({"stage": "error", "message": f"Processing error: {str(exc)}", "progress": 0})
+            finally:
+                await progress_queue.put(None)
+
+        asyncio.create_task(worker())
+
+        while True:
+            item = await progress_queue.get()
+            if item is None:
+                break
+            payload = json.dumps(item)
+            yield f"data: {payload}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================================================
+# Phase 11: Conversational AI Dialogue Partner (Gemini 3.5 Flash-Lite)
+# ============================================================================
+
+class StartDialogueRequest(BaseModel):
+    session_id: Optional[str] = None
+    topic: Optional[str] = "daily_life_and_interests"
+
+
+class DialogueTurnContext(BaseModel):
+    speaker: str  # "ai" or "learner"
+    text: str
+    topic: Optional[str] = None
+
+
+class RespondDialogueRequest(BaseModel):
+    session_id: str
+    turn_id: str
+    learner_transcript: Optional[str] = None
+    audio_base64: Optional[str] = None
+    history: List[DialogueTurnContext] = []
+    current_topic: Optional[str] = "daily_life_and_interests"
+
+
+class TranscribeTurnRequest(BaseModel):
+    audio_base64: str
+    turn_id: Optional[str] = "turn_1"
+
+
+@app.post("/conversation/start-dialogue", summary="Initiate conversation with Gemini opening question")
+async def start_dialogue_endpoint(req: StartDialogueRequest):
+    """
+    Initiates a new conversational session.
+    Gemini 3.5 Flash-Lite generates a friendly, natural opening question.
+    """
+    import uuid
+    session_id = req.session_id or f"session_{uuid.uuid4().hex[:8]}"
+    topic = req.topic or "daily_life_and_interests"
+
+    gemini_svc = GeminiService()
+    res = await gemini_svc.generate_conversational_response(
+        session_id=session_id,
+        history=[],
+        current_topic=topic,
+        is_opening=True,
+    )
+
+    return {
+        "session_id": session_id,
+        "turn_id": "turn_1",
+        "response": res.response,
+        "intent": res.intent,
+        "topic": res.topic,
+        "conversation_complete": res.conversation_complete,
+    }
+
+
+@app.post("/conversation/respond-dialogue", summary="Process learner turn and generate Gemini contextual follow-up")
+async def respond_dialogue_endpoint(req: RespondDialogueRequest):
+    """
+    Processes the learner's spoken turn during the conversation.
+    Decoupled from post-conversation assessment: does NOT run Wav2Vec2 or fluency calculation!
+    Generates a natural, contextual follow-up question via Gemini 3.5 Flash-Lite.
+    Includes graceful recovery if live transcription is temporarily unavailable.
+    """
+    learner_text = (req.learner_transcript or "").strip()
+
+    # Fast transcription if text not pre-provided but audio is available
+    if not learner_text and req.audio_base64:
+        try:
+            raw_audio = req.audio_base64
+            if "," in raw_audio:
+                raw_audio = raw_audio.split(",", 1)[1]
+            import base64
+            audio_bytes = base64.b64decode(raw_audio)
+
+            api_key = get_api_key()
+            if api_key:
+                stt_res = await execute_assemblyai_transcription(
+                    audio_content=audio_bytes,
+                    api_key=api_key,
+                    disfluencies=True,
+                    timeout_seconds=20.0,
+                )
+                learner_text = stt_res.get("text", "").strip()
+        except Exception as stt_err:
+            logger.warning(f"Live turn transcription failed or timed out: {stt_err}")
+            # Graceful recovery: learner_text remains empty, prompting clarification
+
+    # Format history for Gemini
+    history_dicts = [{"speaker": h.speaker, "text": h.text} for h in req.history]
+
+    gemini_svc = GeminiService()
+    gemini_res = await gemini_svc.generate_conversational_response(
+        session_id=req.session_id,
+        history=history_dicts,
+        current_topic=req.current_topic or "daily_life_and_interests",
+        learner_response=learner_text,
+        is_opening=False,
+    )
+
+    # Next turn id calculation
+    curr_num = 1
+    if "_" in req.turn_id:
+        try:
+            curr_num = int(req.turn_id.split("_")[-1])
+        except ValueError:
+            pass
+    next_turn_id = f"turn_{curr_num + 1}"
+
+    return {
+        "session_id": req.session_id,
+        "turn_id": next_turn_id,
+        "response": gemini_res.response,
+        "intent": gemini_res.intent,
+        "topic": gemini_res.topic,
+        "conversation_complete": gemini_res.conversation_complete,
+        "transcribed_text": learner_text if learner_text else None,
+    }
+
+
+@app.post("/conversation/transcribe-turn", summary="Quick live transcription of a single turn")
+async def transcribe_turn_endpoint(req: TranscribeTurnRequest):
+    """
+    Lightweight turn transcription endpoint for responsive conversational UI.
+    """
+    api_key = get_api_key()
+    if not api_key:
+        return {
+            "turn_id": req.turn_id or "turn_1",
+            "transcript": "",
+            "confidence": None,
+            "status": "unavailable",
+            "error": "ASR API key not configured",
+        }
+
+    try:
+        raw_audio = req.audio_base64
+        if "," in raw_audio:
+            raw_audio = raw_audio.split(",", 1)[1]
+        import base64
+        audio_bytes = base64.b64decode(raw_audio)
+
+        stt_res = await execute_assemblyai_transcription(
+            audio_content=audio_bytes,
+            api_key=api_key,
+            disfluencies=True,
+            timeout_seconds=25.0,
+        )
+        return {
+            "turn_id": req.turn_id or "turn_1",
+            "transcript": stt_res.get("text", "").strip(),
+            "confidence": stt_res.get("confidence"),
+            "status": "completed",
+        }
+    except Exception as exc:
+        return {
+            "turn_id": req.turn_id or "turn_1",
+            "transcript": "",
+            "confidence": None,
+            "status": "error",
+            "error": str(exc),
+        }
 
 

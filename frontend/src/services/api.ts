@@ -108,12 +108,22 @@ export async function transcribeAudio(
   audioFile: File | Blob,
   fileName: string,
   disfluencies: boolean = true,
-  phonemeAnalysis: boolean = true
+  phonemeAnalysis: boolean = true,
+  speakingMode: 'prompted' | 'spontaneous' = 'prompted',
+  promptTarget?: string,
+  recordingId?: string
 ): Promise<TranscriptionResponse> {
   const formData = new FormData();
   formData.append('file', audioFile, fileName);
   formData.append('disfluencies', String(disfluencies));
   formData.append('phoneme_analysis', String(phonemeAnalysis));
+  formData.append('speaking_mode', speakingMode);
+  if (promptTarget) {
+    formData.append('prompt_target', promptTarget);
+  }
+  if (recordingId) {
+    formData.append('recording_id', recordingId);
+  }
 
   const res = await fetch(`${API_BASE}/transcribe`, {
     method: 'POST',
@@ -127,8 +137,10 @@ export async function transcribeAudio(
  * Run formal Articula thesis evaluation calculations (WER, speech rate, pause metrics, errors).
  */
 export async function evaluateMetrics(payload: {
-  reference_transcript: string;
+  reference_transcript?: string | null;
   assemblyai_transcript: string;
+  recording_id?: string | null;
+  reference_recording_id?: string | null;
   audio_duration_seconds: number;
   response_interval_seconds?: number;
   detected_pauses?: any[];
@@ -261,4 +273,194 @@ export async function downloadBackendReport(payload: {
     throw new Error(`Report export failed (HTTP ${res.status})`);
   }
   return await res.blob();
+}
+
+/**
+ * Executes post-conversation session analysis (synchronous JSON response).
+ */
+export async function analyzeConversationSession(
+  payload: import('../types').AnalyzeConversationSessionRequest
+): Promise<import('../types').PostConversationReport> {
+  const res = await fetch(`${API_BASE}/conversation/analyze-session`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await parseResponse<{ success: boolean; report: import('../types').PostConversationReport }>(
+    res,
+    'Post-conversation assessment failed'
+  );
+  return data.report;
+}
+
+/**
+ * Streams real-time progress events from the backend for the post-conversation stages:
+ * Transcribing -> Analyzing Fluency -> Analyzing Pronunciation -> Validating Evidence -> Generating Feedback -> Completed.
+ */
+export async function analyzeConversationSessionStream(
+  payload: import('../types').AnalyzeConversationSessionRequest,
+  onProgress: (event: { stage: import('../types').ProcessingStage; message: string; progress: number; report?: import('../types').PostConversationReport }) => void
+): Promise<import('../types').PostConversationReport> {
+  const res = await fetch(`${API_BASE}/conversation/analyze-session-stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Session stream failed (HTTP ${res.status}): ${errorText}`);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new Error('Streaming response body is unavailable.');
+  }
+
+  const decoder = new TextDecoder();
+  let finalReport: import('../types').PostConversationReport | null = null;
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('data:')) {
+        const jsonStr = trimmed.slice(5).trim();
+        if (jsonStr) {
+          try {
+            const parsed = JSON.parse(jsonStr);
+            if (parsed.report) {
+              finalReport = parsed.report;
+            }
+            onProgress(parsed);
+          } catch {
+            // Ignore malformed chunks
+          }
+        }
+      }
+    }
+  }
+
+  if (!finalReport) {
+    throw new Error('Post-conversation assessment ended without returning a report.');
+  }
+
+  return finalReport;
+}
+
+/**
+ * Initiates conversational dialogue session with Gemini 3.5 Flash-Lite opening question.
+ */
+export async function startDialogue(
+  topic?: string,
+  sessionId?: string
+): Promise<import('../types').StartDialogueResponse> {
+  const res = await fetch(`${API_BASE}/conversation/start-dialogue`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      session_id: sessionId,
+      topic: topic || 'daily_life_and_interests',
+    }),
+  });
+
+  return await parseResponse<import('../types').StartDialogueResponse>(
+    res,
+    'Failed to initiate conversation dialogue'
+  );
+}
+
+/**
+ * Responds to learner turn with contextual follow-up question via Gemini 3.5 Flash-Lite.
+ */
+export async function respondDialogue(payload: {
+  session_id: string;
+  turn_id: string;
+  learner_transcript?: string;
+  audio_base64?: string;
+  history: Array<{ speaker: string; text: string; topic?: string }>;
+  current_topic?: string;
+}): Promise<import('../types').RespondDialogueResponse> {
+  const res = await fetch(`${API_BASE}/conversation/respond-dialogue`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return await parseResponse<import('../types').RespondDialogueResponse>(
+    res,
+    'Failed to generate conversational follow-up'
+  );
+}
+
+/**
+ * Transcribes a single turn audio rapidly without post-conversation pipeline delay.
+ */
+export async function transcribeTurn(
+  audioBase64: string,
+  turnId?: string
+): Promise<{ turn_id: string; transcript: string; confidence?: number | null; status: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/conversation/transcribe-turn`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      audio_base64: audioBase64,
+      turn_id: turnId || 'turn_1',
+    }),
+  });
+
+  return await parseResponse<{ turn_id: string; transcript: string; confidence?: number | null; status: string; error?: string }>(
+    res,
+    'Failed to transcribe turn'
+  );
+}
+
+/**
+ * Tests Gemini 3.5 Flash-Lite API connection via backend.
+ */
+export async function testGeminiConnection(): Promise<{
+  success: boolean;
+  message: string;
+  model?: string;
+  error?: string;
+}> {
+  try {
+    const res = await fetch(`${API_BASE}/test-gemini-connection`, {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+    });
+    return await parseResponse<{ success: boolean; message: string; model?: string; error?: string }>(
+      res,
+      'Failed to test Gemini connection'
+    );
+  } catch (err: any) {
+    return {
+      success: false,
+      message: err.message || 'Error connecting to Gemini backend endpoint',
+      error: 'network_error',
+    };
+  }
 }

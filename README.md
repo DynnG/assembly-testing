@@ -139,15 +139,19 @@ Researchers can select any preset scenario, edit reference transcripts and metad
 ## 4. Setup and Execution Instructions (Windows PowerShell)
 
 ### Step 1: Configure Backend Environment
-Ensure `backend/.env` contains your AssemblyAI API key:
+Ensure `backend/.env` contains your AssemblyAI API key and Gemini API key:
 ```powershell
 # Copy template if .env does not exist yet
 Copy-Item backend\.env.example backend\.env
 ```
-Open `backend/.env` and insert your key:
+Open `backend/.env` and insert your keys:
 ```env
 ASSEMBLYAI_API_KEY=your_actual_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3.5-flash-lite
 ```
+
+> **Note on Secure Gemini Integration:** The `GEMINI_API_KEY` is loaded strictly by the backend environment. It is never transmitted to the browser, source maps, client code, or frontend state. When `GEMINI_API_KEY` is absent or offline, Articula automatically falls back to its deterministic expert phonetic engine.
 
 ### Step 2: Run Automated Backend Unit Tests
 To verify all formulas (WER, WPM, pauses, silence detection, MAE, F1, and phoneme comparison):

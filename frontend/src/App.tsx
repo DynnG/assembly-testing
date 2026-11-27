@@ -12,8 +12,18 @@ import { AiAnalysisSummaryCard } from './components/AiAnalysisSummaryCard';
 import { EvaluationResultsCard } from './components/EvaluationResultsCard';
 import { ExportCard } from './components/ExportCard';
 import { SessionHistoryCard } from './components/SessionHistoryCard';
+import { ConversationRecorderCard } from './components/ConversationRecorderCard';
+import { PostConversationProgressCard } from './components/PostConversationProgressCard';
+import { PostConversationReportCard } from './components/PostConversationReportCard';
 
-import { getHealth, testConnection, transcribeAudio, evaluateMetrics } from './services/api';
+import {
+  getHealth,
+  testConnection,
+  testGeminiConnection,
+  transcribeAudio,
+  evaluateMetrics,
+  analyzeConversationSessionStream,
+} from './services/api';
 import { analyzeAudioSilence } from './services/audioAnalysis';
 import { STANDARD_TEST_SCENARIOS } from './data/testScenarios';
 import type {
@@ -23,15 +33,39 @@ import type {
   TestConnectionResponse,
   TestSessionRecord,
   TranscriptionResponse,
+  ConversationTurn,
+  PostConversationReport,
+  ProcessingStage,
+  ConversationSessionRecord,
 } from './types';
-import { Play, AlertCircle, ToggleRight, ToggleLeft, Volume2 } from 'lucide-react';
+import { Play, AlertCircle, ToggleRight, ToggleLeft, Volume2, MessageSquare, FileAudio } from 'lucide-react';
 
 export const App: React.FC = () => {
+  // Mode: 'conversation' (Conversation-First Post-Assessment) vs 'benchmark' (Test Bench)
+  const [appMode, setAppMode] = useState<'conversation' | 'benchmark'>('conversation');
+
+  // Conversational Assessment state
+  const [conversationStage, setConversationStage] = useState<ProcessingStage>('recording');
+  const [conversationStageMsg, setConversationStageMsg] = useState<string>('Ready for conversational turns');
+  const [conversationProgress, setConversationProgress] = useState<number>(0);
+  const [isConversationAssessing, setIsConversationAssessing] = useState<boolean>(false);
+  const [activeConversationReport, setActiveConversationReport] = useState<PostConversationReport | null>(null);
+  const [conversationHistory, setConversationHistory] = useState<ConversationSessionRecord[]>([]);
+
   // Backend & API Key state
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const [apiKeyConfigured, setApiKeyConfigured] = useState<boolean | null>(null);
+  const [geminiConfigured, setGeminiConfigured] = useState<boolean | null>(null);
+  const [geminiModel, setGeminiModel] = useState<string>('gemini-3.5-flash-lite');
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false);
+  const [isTestingGemini, setIsTestingGemini] = useState<boolean>(false);
   const [connectionTestResult, setConnectionTestResult] = useState<TestConnectionResponse | null>(null);
+  const [geminiTestResult, setGeminiTestResult] = useState<{
+    success: boolean;
+    message: string;
+    model?: string;
+    error?: string;
+  } | null>(null);
 
   // Test Case Scenario & Metadata state
   const [currentScenario, setCurrentScenario] = useState<TestCaseScenario>(STANDARD_TEST_SCENARIOS[0]);
@@ -41,6 +75,12 @@ export const App: React.FC = () => {
   const [responseIntervalSeconds, setResponseIntervalSeconds] = useState<number>(
     STANDARD_TEST_SCENARIOS[0].reference_response_duration_seconds
   );
+  const [recordingSessionId, setRecordingSessionId] = useState<string>(STANDARD_TEST_SCENARIOS[0].id);
+  const [referenceRecordingId, setReferenceRecordingId] = useState<string | null>(STANDARD_TEST_SCENARIOS[0].id);
+
+  // Speaking Practice Scenario state (Prompted target word vs Spontaneous speech)
+  const [speakingMode, setSpeakingMode] = useState<'prompted' | 'spontaneous'>('prompted');
+  const [promptTarget, setPromptTarget] = useState<string>('think');
 
   // Audio input state
   const [selectedAudioFile, setSelectedAudioFile] = useState<File | null>(null);
@@ -72,9 +112,12 @@ export const App: React.FC = () => {
       const data = await getHealth();
       setBackendOnline(data.status === 'ok');
       setApiKeyConfigured(data.api_key_configured);
+      setGeminiConfigured(data.gemini_api_key_configured ?? false);
+      setGeminiModel(data.gemini_model || 'gemini-3.5-flash-lite');
     } catch {
       setBackendOnline(false);
       setApiKeyConfigured(null);
+      setGeminiConfigured(null);
     }
   };
 
@@ -91,7 +134,7 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Test Connection
+  // Test AssemblyAI Connection
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
     setConnectionTestResult(null);
@@ -106,10 +149,28 @@ export const App: React.FC = () => {
     }
   };
 
+  // Test Gemini 3.5 Flash-Lite Connection
+  const handleTestGeminiConnection = async () => {
+    setIsTestingGemini(true);
+    setGeminiTestResult(null);
+    try {
+      const result = await testGeminiConnection();
+      setGeminiTestResult(result);
+      if (result.success) {
+        setGeminiConfigured(true);
+      }
+    } finally {
+      setIsTestingGemini(false);
+    }
+  };
+
   // Scenario selection handler
   const handleSelectScenario = (scenario: TestCaseScenario) => {
     setCurrentScenario(scenario);
     setReferenceTranscript(scenario.reference_transcript);
+    setReferenceRecordingId(scenario.id);
+    setRecordingSessionId(scenario.id);
+    setPromptTarget(scenario.reference_transcript);
     setResponseIntervalSeconds(scenario.reference_response_duration_seconds);
 
     // If current transcript already exists, automatically trigger evaluation recalculation
@@ -120,7 +181,9 @@ export const App: React.FC = () => {
         currentResult.audio_duration || audioDurationSec || scenario.reference_response_duration_seconds,
         scenario.reference_response_duration_seconds,
         detectedPauses,
-        scenario
+        scenario,
+        scenario.id,
+        scenario.id
       );
     }
   };
@@ -138,6 +201,17 @@ export const App: React.FC = () => {
     if (durationSec && durationSec > 0) {
       setResponseIntervalSeconds(durationSec);
     }
+
+    // Data Integrity Guard:
+    // When a custom or new audio file is loaded, decouple previous reference transcript
+    // and clear it to prevent cross-recording reference contamination!
+    const newSessionId = file
+      ? `rec_${file.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}`
+      : `rec_custom_${Date.now()}`;
+    setRecordingSessionId(newSessionId);
+    setReferenceTranscript(''); // Clear stale reference to prevent false WER!
+    setReferenceRecordingId(null);
+    setEvaluationResult(null);
   };
 
   // Recalculate evaluation formulas without re-transcribing
@@ -147,12 +221,16 @@ export const App: React.FC = () => {
     audioDur: number,
     respInterval: number,
     pauses: SilencePauseEvent[],
-    scenario: TestCaseScenario
+    scenario: TestCaseScenario,
+    recId?: string,
+    refRecId?: string | null
   ) => {
     try {
       const evalRes = await evaluateMetrics({
         reference_transcript: refText,
         assemblyai_transcript: hypText,
+        recording_id: recId || recordingSessionId,
+        reference_recording_id: refRecId !== undefined ? refRecId : referenceRecordingId,
         audio_duration_seconds: audioDur,
         response_interval_seconds: respInterval,
         detected_pauses: pauses,
@@ -188,11 +266,15 @@ export const App: React.FC = () => {
     }, 100);
 
     try {
-      // 1. Send audio to AssemblyAI backend
+      // 1. Send audio to AssemblyAI backend with decoupled speaking mode & prompt target
       const transcriptData = await transcribeAudio(
         selectedAudioFile,
         selectedAudioFile.name,
-        disfluenciesEnabled
+        disfluenciesEnabled,
+        true, // phonemeAnalysis
+        speakingMode,
+        speakingMode === 'prompted' ? promptTarget : undefined,
+        recordingSessionId
       );
 
       setCurrentResult(transcriptData);
@@ -212,7 +294,7 @@ export const App: React.FC = () => {
       }
       setDetectedPauses(pauses);
 
-      // 3. Compute Articula thesis evaluation formulas
+      // 3. Compute Articula thesis evaluation formulas with recording provenance check
       const effectiveDuration =
         transcriptData.audio_duration || audioDurationSec || responseIntervalSeconds || 1.0;
       const effectiveInterval = responseIntervalSeconds > 0 ? responseIntervalSeconds : effectiveDuration;
@@ -223,7 +305,9 @@ export const App: React.FC = () => {
         effectiveDuration,
         effectiveInterval,
         pauses,
-        currentScenario
+        currentScenario,
+        recordingSessionId,
+        referenceRecordingId
       );
 
       // 4. Record complete provenance entry to session history
@@ -381,6 +465,87 @@ export const App: React.FC = () => {
     }
   };
 
+  // Conversational Assessment Handlers
+  const handleSessionComplete = async (
+    turns: ConversationTurn[],
+    mode: 'prompted' | 'spontaneous',
+    target?: string
+  ) => {
+    if (turns.length === 0 || isConversationAssessing) return;
+
+    const sessionId = `session_${Date.now()}`;
+    setIsConversationAssessing(true);
+    setConversationStage('session_ended');
+    setConversationStageMsg('Conversation completed. Starting post-conversation assessment pipeline...');
+    setConversationProgress(5);
+    setActiveConversationReport(null);
+
+    try {
+      const report = await analyzeConversationSessionStream(
+        {
+          session_id: sessionId,
+          speaking_mode: mode,
+          prompt_target: target,
+          preferred_accent: 'General English',
+          min_pause_duration_seconds: minPauseDuration,
+          silence_threshold_db: silenceThresholdDb,
+          turns: turns.map((t) => ({
+            turn_id: t.turn_id,
+            audio_base64: t.audio_base64,
+            transcript: t.transcript,
+            duration_seconds: t.duration_seconds,
+            prompt_target: t.prompt_target,
+            speaking_mode: t.speaking_mode,
+            detected_pauses: t.detected_pauses,
+          })),
+        },
+        (event) => {
+          setConversationStage(event.stage);
+          setConversationStageMsg(event.message);
+          setConversationProgress(event.progress);
+          if (event.report) {
+            setActiveConversationReport(event.report);
+          }
+        }
+      );
+
+      setActiveConversationReport(report);
+      setConversationStage('completed');
+      setConversationStageMsg('Post-conversation assessment completed.');
+      setConversationProgress(100);
+
+      // Save to Conversation Session History
+      const sessionRecord: ConversationSessionRecord = {
+        session_id: sessionId,
+        timestamp: new Date().toLocaleTimeString(),
+        speaking_mode: mode,
+        prompt_target: target,
+        turn_count: turns.length,
+        total_duration_seconds: turns.reduce((acc, t) => acc + t.duration_seconds, 0),
+        turns: turns,
+        report: report,
+        status: 'completed',
+      };
+      setConversationHistory((prev) => [sessionRecord, ...prev]);
+    } catch (err: any) {
+      console.error('Session processing error:', err);
+      setConversationStage('error');
+      setConversationStageMsg(err.message || 'Post-conversation assessment encountered an error.');
+    } finally {
+      setIsConversationAssessing(false);
+    }
+  };
+
+  const handleRevisitConversationSession = (session: ConversationSessionRecord) => {
+    if (session.report) {
+      setActiveConversationReport(session.report);
+      setConversationStage('completed');
+      setConversationStageMsg(`Reopened completed report for ${session.session_id}`);
+      setConversationProgress(100);
+      setAppMode('conversation');
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#0B1120] text-slate-100 flex flex-col selection:bg-teal-500 selection:text-white">
       {/* App Header */}
@@ -395,219 +560,358 @@ export const App: React.FC = () => {
         <ApiStatusCard
           backendOnline={backendOnline}
           apiKeyConfigured={apiKeyConfigured}
+          geminiConfigured={geminiConfigured}
+          geminiModel={geminiModel}
           onRefreshHealth={checkHealth}
           onTestConnection={handleTestConnection}
+          onTestGeminiConnection={handleTestGeminiConnection}
           isTesting={isTestingConnection}
+          isTestingGemini={isTestingGemini}
           testResult={connectionTestResult}
+          geminiTestResult={geminiTestResult}
         />
 
-        {/* Test Case Manager & 10 Standard Scenarios */}
-        <TestCaseSelectorCard
-          currentScenario={currentScenario}
-          onSelectScenario={handleSelectScenario}
-          onUpdateScenarioFields={handleUpdateScenarioFields}
-          isProcessing={isTranscribing}
-        />
+        {/* Architecture Mode Navigation: Conversation-First vs Benchmark Test Bench */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-2.5 rounded-xl shadow-lg">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setAppMode('conversation')}
+              className={`px-4 py-2 rounded-lg font-semibold text-xs flex items-center gap-2 transition-all ${
+                appMode === 'conversation'
+                  ? 'bg-teal-500 text-slate-950 shadow-md shadow-teal-500/20'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <MessageSquare className="w-4 h-4" />
+              <span>Conversation-First Assessment</span>
+              <span className="text-[10px] bg-slate-950/40 px-1.5 py-0.5 rounded-full font-mono">
+                Primary Flow
+              </span>
+            </button>
+            <button
+              onClick={() => setAppMode('benchmark')}
+              className={`px-4 py-2 rounded-lg font-semibold text-xs flex items-center gap-2 transition-all ${
+                appMode === 'benchmark'
+                  ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/20'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <FileAudio className="w-4 h-4" />
+              <span>Benchmark Test Bench (10 Scenarios)</span>
+            </button>
+          </div>
 
-        {/* Section A: Audio Input (Upload & Record) */}
-        <AudioInputCard
-          onAudioReady={handleAudioReady}
-          isProcessing={isTranscribing}
-          selectedPromptText={referenceTranscript}
-        />
+          <div className="text-xs text-slate-400 hidden sm:block">
+            {appMode === 'conversation'
+              ? 'Uninterrupted dialogue with post-conversation sequential assessment'
+              : 'Isolated audio upload & reference transcript WER evaluation'}
+          </div>
+        </div>
 
-        {/* Section B & Controls: Transcription & Silence Parameters */}
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg shadow-black/20 space-y-4">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-            {/* Disfluency & Pause Controls */}
-            <div className="flex flex-wrap items-center gap-4">
-              {/* Disfluency Toggle */}
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setDisfluenciesEnabled((prev) => !prev)}
-                  className="text-teal-400 hover:text-teal-300 transition-colors"
-                >
-                  {disfluenciesEnabled ? (
-                    <ToggleRight className="w-8 h-8 text-teal-400" />
-                  ) : (
-                    <ToggleLeft className="w-8 h-8 text-slate-500" />
+        {/* VIEW 1: CONVERSATION-FIRST ASSESSMENT (Primary Flow) */}
+        {appMode === 'conversation' && (
+          <div className="space-y-6">
+            {/* Conversation Multi-Turn Dialogue Card */}
+            <ConversationRecorderCard
+              onSessionComplete={handleSessionComplete}
+              isProcessing={isConversationAssessing}
+              speakingMode={speakingMode}
+              onSpeakingModeChange={setSpeakingMode}
+              promptTarget={promptTarget}
+              onPromptTargetChange={setPromptTarget}
+            />
+
+            {/* Sequential Real Backend Progress Stepper */}
+            {(isConversationAssessing || conversationStage !== 'recording') && (
+              <PostConversationProgressCard
+                currentStage={conversationStage}
+                stageMessage={conversationStageMsg}
+                progressPercent={conversationProgress}
+              />
+            )}
+
+            {/* Consolidated 5-Section Post-Conversation Assessment Report */}
+            {activeConversationReport && (
+              <PostConversationReportCard report={activeConversationReport} />
+            )}
+
+            {/* Conversation Session History */}
+            <SessionHistoryCard
+              history={sessionHistory}
+              conversationHistory={conversationHistory}
+              onClearHistory={() => setSessionHistory([])}
+              onClearConversationHistory={() => setConversationHistory([])}
+              onSelectHistoryItem={handleSelectHistoryItem}
+              onSelectConversationSession={handleRevisitConversationSession}
+            />
+          </div>
+        )}
+
+        {/* VIEW 2: BENCHMARK TEST BENCH (Secondary Flow) */}
+        {appMode === 'benchmark' && (
+          <div className="space-y-6">
+            {/* Test Case Manager & 10 Standard Scenarios */}
+            <TestCaseSelectorCard
+              currentScenario={currentScenario}
+              onSelectScenario={handleSelectScenario}
+              onUpdateScenarioFields={handleUpdateScenarioFields}
+              isProcessing={isTranscribing}
+            />
+
+            {/* Section A: Audio Input (Upload & Record) */}
+            <AudioInputCard
+              onAudioReady={handleAudioReady}
+              isProcessing={isTranscribing}
+              selectedPromptText={referenceTranscript}
+            />
+
+            {/* Section B & Controls: Transcription & Silence Parameters */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg shadow-black/20 space-y-4">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                {/* Disfluency & Pause Controls */}
+                <div className="flex flex-wrap items-center gap-4">
+                  {/* Disfluency Toggle */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDisfluenciesEnabled((prev) => !prev)}
+                      className="text-teal-400 hover:text-teal-300 transition-colors"
+                    >
+                      {disfluenciesEnabled ? (
+                        <ToggleRight className="w-8 h-8 text-teal-400" />
+                      ) : (
+                        <ToggleLeft className="w-8 h-8 text-slate-500" />
+                      )}
+                    </button>
+                    <div>
+                      <span className="text-xs font-semibold text-white">
+                        Disfluencies <code className="text-[11px] font-mono text-teal-400 bg-slate-950 px-1 py-0.5 rounded">disfluencies={String(disfluenciesEnabled)}</code>
+                      </span>
+                      <div className="text-[11px] text-slate-400">Preserves "um", "uh", repetitions</div>
+                    </div>
+                  </div>
+
+                  {/* Min Pause Threshold Config */}
+                  <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800 text-xs">
+                    <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+                    <span className="text-slate-400">Min Pause:</span>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0.1"
+                      max="2.0"
+                      value={minPauseDuration}
+                      onChange={(e) => setMinPauseDuration(parseFloat(e.target.value) || 0.25)}
+                      disabled={isTranscribing}
+                      className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono text-center focus:border-teal-500"
+                    />
+                    <span className="text-slate-400">s</span>
+                  </div>
+
+                  {/* Silence Threshold dBFS Config */}
+                  <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800 text-xs">
+                    <span className="text-slate-400">Silence dBFS:</span>
+                    <input
+                      type="number"
+                      step="1"
+                      max="-10"
+                      min="-70"
+                      value={silenceThresholdDb}
+                      onChange={(e) => setSilenceThresholdDb(parseFloat(e.target.value) || -35.0)}
+                      disabled={isTranscribing}
+                      className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono text-center focus:border-teal-500"
+                    />
+                    <span className="text-slate-400">dB</span>
+                  </div>
+                </div>
+
+                {/* Speaking Scenario Mode (Prompted Practice vs Spontaneous Speech) */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-slate-950/80 border border-slate-800 rounded-lg text-xs w-full">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-semibold text-slate-300">Speaking Scenario Mode:</span>
+                    <div className="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
+                      <button
+                        onClick={() => setSpeakingMode('prompted')}
+                        className={`px-3 py-1 rounded-md font-medium text-xs transition-all ${
+                          speakingMode === 'prompted'
+                            ? 'bg-purple-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Prompted Practice
+                      </button>
+                      <button
+                        onClick={() => setSpeakingMode('spontaneous')}
+                        className={`px-3 py-1 rounded-md font-medium text-xs transition-all ${
+                          speakingMode === 'spontaneous'
+                            ? 'bg-blue-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Spontaneous Speech
+                      </button>
+                    </div>
+                  </div>
+
+                  {speakingMode === 'prompted' && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-slate-400 text-[11px] whitespace-nowrap">Prompt Target:</span>
+                      <input
+                        type="text"
+                        value={promptTarget}
+                        onChange={(e) => setPromptTarget(e.target.value)}
+                        placeholder="e.g. think"
+                        className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-xs text-white font-mono focus:outline-none focus:border-purple-500 w-44"
+                      />
+                    </div>
                   )}
-                </button>
-                <div>
-                  <span className="text-xs font-semibold text-white">
-                    Disfluencies <code className="text-[11px] font-mono text-teal-400 bg-slate-950 px-1 py-0.5 rounded">disfluencies={String(disfluenciesEnabled)}</code>
-                  </span>
-                  <div className="text-[11px] text-slate-400">Preserves "um", "uh", repetitions</div>
+                </div>
+
+                {/* Transcribe Button */}
+                <div className="flex items-center gap-3 self-end lg:self-center">
+                  <button
+                    onClick={handleTranscribe}
+                    disabled={!selectedAudioFile || isTranscribing || !backendOnline || apiKeyConfigured === false}
+                    className={`px-6 py-2.5 rounded-lg font-semibold text-xs flex items-center gap-2 transition-all shadow-lg ${
+                      !selectedAudioFile || isTranscribing || !backendOnline || apiKeyConfigured === false
+                        ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700/50'
+                        : 'bg-teal-500 hover:bg-teal-400 active:bg-teal-600 text-slate-950 shadow-teal-500/20'
+                    }`}
+                  >
+                    {isTranscribing ? (
+                      <>
+                        <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
+                        <span>Transcribing & Evaluating ({transcriptionElapsedSec.toFixed(1)}s)...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4 fill-current" />
+                        <span>Transcribe Audio</span>
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
 
-              {/* Min Pause Threshold Config */}
-              <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800 text-xs">
-                <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
-                <span className="text-slate-400">Min Pause:</span>
-                <input
-                  type="number"
-                  step="0.05"
-                  min="0.1"
-                  max="2.0"
-                  value={minPauseDuration}
-                  onChange={(e) => setMinPauseDuration(parseFloat(e.target.value) || 0.25)}
-                  disabled={isTranscribing}
-                  className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono text-center focus:border-teal-500"
-                />
-                <span className="text-slate-400">s</span>
-              </div>
-
-              {/* Silence Threshold dBFS Config */}
-              <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800 text-xs">
-                <span className="text-slate-400">Silence dBFS:</span>
-                <input
-                  type="number"
-                  step="1"
-                  max="-10"
-                  min="-70"
-                  value={silenceThresholdDb}
-                  onChange={(e) => setSilenceThresholdDb(parseFloat(e.target.value) || -35.0)}
-                  disabled={isTranscribing}
-                  className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono text-center focus:border-teal-500"
-                />
-                <span className="text-slate-400">dB</span>
-              </div>
+              {/* Error Banner */}
+              {transcriptionError && (
+                <div className="p-3.5 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs text-rose-300 flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <span className="font-semibold">Transcription Request Failed:</span>
+                    <p className="text-slate-200">{transcriptionError}</p>
+                  </div>
+                </div>
+              )}
             </div>
 
-            {/* Transcribe Button */}
-            <div className="flex items-center gap-3 self-end lg:self-center">
-              <button
-                onClick={handleTranscribe}
-                disabled={!selectedAudioFile || isTranscribing || !backendOnline || apiKeyConfigured === false}
-                className={`px-6 py-2.5 rounded-lg font-semibold text-xs flex items-center gap-2 transition-all shadow-lg ${
-                  !selectedAudioFile || isTranscribing || !backendOnline || apiKeyConfigured === false
-                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700/50'
-                    : 'bg-teal-500 hover:bg-teal-400 active:bg-teal-600 text-slate-950 shadow-teal-500/20'
-                }`}
-              >
-                {isTranscribing ? (
-                  <>
-                    <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                    <span>Transcribing & Evaluating ({transcriptionElapsedSec.toFixed(1)}s)...</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-4 h-4 fill-current" />
-                    <span>Transcribe Audio</span>
-                  </>
-                )}
-              </button>
-            </div>
+            {/* Section B: Verbatim Transcription Output */}
+            <TranscriptionResultsCard
+              result={currentResult}
+              isProcessing={isTranscribing}
+              elapsedSec={transcriptionElapsedSec}
+            />
+
+            {/* Section C: Pipeline A: Reference Transcript & Word Error Rate (WER) */}
+            <ReferenceAndWerCard
+              referenceTranscript={referenceTranscript}
+              onReferenceChange={(text) => {
+                setReferenceTranscript(text);
+                setReferenceRecordingId(recordingSessionId);
+              }}
+              alignmentResult={evaluationResult?.alignment || null}
+              recordingId={recordingSessionId}
+              referenceRecordingId={referenceRecordingId}
+              scenarioTitle={currentScenario.title}
+              onRecalculateAlignment={() => {
+                if (currentResult?.text) {
+                  recalculateEvaluation(
+                    referenceTranscript,
+                    currentResult.text,
+                    currentResult.audio_duration || audioDurationSec || 1.0,
+                    responseIntervalSeconds,
+                    detectedPauses,
+                    currentScenario,
+                    recordingSessionId,
+                    recordingSessionId
+                  );
+                }
+              }}
+              isProcessing={isTranscribing}
+            />
+
+            {/* Section D: Speech Measurements & Fluency Indicators */}
+            <SpeechMeasurementsCard
+              audioDurationSeconds={currentResult?.audio_duration || audioDurationSec || 0}
+              responseIntervalSeconds={responseIntervalSeconds}
+              onResponseIntervalChange={(interval) => {
+                setResponseIntervalSeconds(interval);
+                if (currentResult?.text) {
+                  recalculateEvaluation(
+                    referenceTranscript,
+                    currentResult.text,
+                    currentResult.audio_duration || audioDurationSec || interval,
+                    interval,
+                    detectedPauses,
+                    currentScenario
+                  );
+                }
+              }}
+              recognizedWordCount={evaluationResult?.alignment.recognized_word_count ?? 0}
+              speechRateResult={evaluationResult?.speech_rate || null}
+              pauseMetricsResult={evaluationResult?.pause_metrics || null}
+              repetitionRateResult={evaluationResult?.repetition_metrics.repetition_rate || null}
+              selfCorrectionCandidates={evaluationResult?.self_corrections.candidates || []}
+              detectedPauses={detectedPauses}
+              isProcessing={isTranscribing}
+            />
+
+            {/* Section E: AI-Assisted Analysis Summary & Articulatory Phonetics */}
+            {currentResult && (
+              <AiAnalysisSummaryCard
+                currentResult={currentResult}
+                evaluationResult={evaluationResult}
+                preferredAccent="General American"
+              />
+            )}
+
+            {/* Section F: Pipeline B: Word-Level Diagnostic & Pronunciation Characteristics */}
+            {currentResult?.words && currentResult.words.length > 0 && (
+              <WordDiagnosticCard
+                words={currentResult.words}
+                fullTranscription={currentResult.full_transcription || currentResult.text}
+                audioMetadata={currentResult.audio_metadata}
+                minPauseThresholdSeconds={minPauseDuration}
+                speakingMode={speakingMode}
+                promptTarget={speakingMode === 'prompted' ? promptTarget : undefined}
+              />
+            )}
+
+            {/* Section F: Quantitative Evaluation Results (MAE, Precision, Recall, F1) */}
+            <EvaluationResultsCard
+              evaluationResult={evaluationResult}
+              hasReferenceData={Boolean(currentScenario.reference_transcript)}
+            />
+
+            {/* Section G: Research Data & Reproducibility Exports */}
+            <ExportCard
+              currentResult={currentResult}
+              currentScenario={currentScenario}
+              evaluationResult={evaluationResult}
+              sessionHistory={sessionHistory}
+            />
+
+            {/* Benchmark Session History */}
+            <SessionHistoryCard
+              history={sessionHistory}
+              conversationHistory={conversationHistory}
+              onClearHistory={() => setSessionHistory([])}
+              onClearConversationHistory={() => setConversationHistory([])}
+              onSelectHistoryItem={handleSelectHistoryItem}
+              onSelectConversationSession={handleRevisitConversationSession}
+            />
           </div>
-
-          {/* Error Banner */}
-          {transcriptionError && (
-            <div className="p-3.5 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs text-rose-300 flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <span className="font-semibold">Transcription Request Failed:</span>
-                <p className="text-slate-200">{transcriptionError}</p>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Section B: Verbatim Transcription Output */}
-        <TranscriptionResultsCard
-          result={currentResult}
-          isProcessing={isTranscribing}
-          elapsedSec={transcriptionElapsedSec}
-        />
-
-        {/* Section C: Reference Transcript & Word Error Rate (WER) */}
-        <ReferenceAndWerCard
-          referenceTranscript={referenceTranscript}
-          onReferenceChange={(text) => {
-            setReferenceTranscript(text);
-          }}
-          alignmentResult={evaluationResult?.alignment || null}
-          onRecalculateAlignment={() => {
-            if (currentResult?.text) {
-              recalculateEvaluation(
-                referenceTranscript,
-                currentResult.text,
-                currentResult.audio_duration || audioDurationSec || 1.0,
-                responseIntervalSeconds,
-                detectedPauses,
-                currentScenario
-              );
-            }
-          }}
-          isProcessing={isTranscribing}
-        />
-
-        {/* Section D: Speech Measurements & Fluency Indicators */}
-        <SpeechMeasurementsCard
-          audioDurationSeconds={currentResult?.audio_duration || audioDurationSec || 0}
-          responseIntervalSeconds={responseIntervalSeconds}
-          onResponseIntervalChange={(interval) => {
-            setResponseIntervalSeconds(interval);
-            if (currentResult?.text) {
-              recalculateEvaluation(
-                referenceTranscript,
-                currentResult.text,
-                currentResult.audio_duration || audioDurationSec || interval,
-                interval,
-                detectedPauses,
-                currentScenario
-              );
-            }
-          }}
-          recognizedWordCount={evaluationResult?.alignment.recognized_word_count ?? 0}
-          speechRateResult={evaluationResult?.speech_rate || null}
-          pauseMetricsResult={evaluationResult?.pause_metrics || null}
-          repetitionRateResult={evaluationResult?.repetition_metrics.repetition_rate || null}
-          selfCorrectionCandidates={evaluationResult?.self_corrections.candidates || []}
-          detectedPauses={detectedPauses}
-          isProcessing={isTranscribing}
-        />
-
-        {/* Section E: AI-Assisted Analysis Summary & Articulatory Phonetics */}
-        {currentResult && (
-          <AiAnalysisSummaryCard
-            currentResult={currentResult}
-            evaluationResult={evaluationResult}
-            preferredAccent="General American"
-          />
         )}
-
-        {/* Section F: Word-Level Diagnostic & Timestamp Inspector */}
-        {currentResult?.words && currentResult.words.length > 0 && (
-          <WordDiagnosticCard
-            words={currentResult.words}
-            fullTranscription={currentResult.full_transcription || currentResult.text}
-            audioMetadata={currentResult.audio_metadata}
-            minPauseThresholdSeconds={minPauseDuration}
-          />
-        )}
-
-        {/* Section F: Quantitative Evaluation Results (MAE, Precision, Recall, F1) */}
-        <EvaluationResultsCard
-          evaluationResult={evaluationResult}
-          hasReferenceData={Boolean(currentScenario.reference_transcript)}
-        />
-
-        {/* Section G: Research Data & Reproducibility Exports */}
-        <ExportCard
-          currentResult={currentResult}
-          currentScenario={currentScenario}
-          evaluationResult={evaluationResult}
-          sessionHistory={sessionHistory}
-        />
-
-        {/* Session Test History */}
-        <SessionHistoryCard
-          history={sessionHistory}
-          onClearHistory={() => setSessionHistory([])}
-          onSelectHistoryItem={handleSelectHistoryItem}
-        />
       </main>
 
       {/* Footer */}

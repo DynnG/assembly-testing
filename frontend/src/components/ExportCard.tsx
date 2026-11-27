@@ -94,7 +94,7 @@ export const ExportCard: React.FC<ExportCardProps> = ({
         '--------------------------------------------------------------------------------',
         `Total Words:        ${currentResult.words?.length || 0}`,
         `Speech Rate:        ${evaluationResult?.speech_rate?.speech_rate_wpm ?? 'N/A'} WPM`,
-        `Word Error Rate:    ${evaluationResult?.alignment?.word_error_rate_percent ?? 'N/A'}%`,
+        `Word Error Rate:    ${evaluationResult?.alignment?.word_error_rate_percent !== null && evaluationResult?.alignment?.word_error_rate_percent !== undefined ? `${evaluationResult.alignment.word_error_rate_percent}%` : 'Unavailable (unverified ground-truth reference)'}`,
         `Silent Pauses:      ${evaluationResult?.pause_metrics?.pause_count ?? 0} pauses`,
         '',
       ];

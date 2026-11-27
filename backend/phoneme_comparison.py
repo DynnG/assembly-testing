@@ -1075,17 +1075,33 @@ def generate_pronunciation_findings(
     reference_source: str,
     audio_clip: Optional[str] = None,
     expected_phonemes_str: Optional[str] = None,
+    target_word: Optional[str] = None,
+    recognized_word: Optional[str] = None,
+    speaking_mode: str = "prompted",
+    audio_quality_status: Optional[str] = "normal",
+    duration_ms: Optional[int] = None,
+    segmentation_status: Optional[str] = "valid",
 ) -> List[Dict[str, Any]]:
     """
-    Converts raw phonetic differences into structured, evidence-based observations.
-    Categorizes differences into consonant/vowel substitutions, deletions, and insertions.
-    Prepares clear articulatory guidance and practice targets for future feedback generation.
-    
-    IMPORTANT:
-    Flags observations with confidence_level='requires_validation' and
-    validation_status='unvalidated_single_occurrence' to avoid premature clinical diagnoses.
+    Converts raw phonetic differences into structured, evidence-constrained observations.
+
+    Guarantees & Evidence Constraints (Section 5):
+    1. Separates findings into explicit categories:
+       - 'validated_observation': High-evidence acoustic difference (prompted target contrast with clean audio >= 80ms)
+       - 'candidate_difference': Candidate discrepancy requiring multi-token or acoustic confirmation
+       - 'insufficient_evidence': Segment too short (<80ms), near-silence, or clipped
+       - 'human_review_required': Spontaneous speech candidate ambiguity, accent variation, or coarticulation
+       - 'analysis_unavailable': Missing reference, missing audio, or unsupported dictionary target
+    2. Groups related findings by word and phoneme; prevents duplicate entries.
+    3. Strictly suppresses articulatory instruction for invalid, missing, or unvalidated predictions.
+    4. Decouples ASR confidence from pronunciation accuracy.
     """
     findings: List[Dict[str, Any]] = []
+    eff_target = target_word or word
+    eff_rec = recognized_word or word
+
+    # Track seen findings to group related findings and avoid duplicates per word
+    seen_keys = set()
 
     for item in alignment:
         op = item["operation"]
@@ -1096,6 +1112,12 @@ def generate_pronunciation_findings(
         pred = item.get("predicted")
         pos = item.get("position", 0)
 
+        # Deduplicate identical word + expected + predicted + diff_type
+        dedup_key = (eff_target.lower(), exp, pred, op)
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+
         exp_profile = classify_phonetic_token(exp)
         pred_profile = classify_phonetic_token(pred)
 
@@ -1104,36 +1126,119 @@ def generate_pronunciation_findings(
 
         # Determine observed characteristic
         if op == "substitution":
-            if exp_cat == "consonant" and pred_cat == "consonant":
+            if exp == "θ" and pred == "s":
+                characteristic = "dental_to_alveolar_fricative_substitution"
+            elif exp == "ð" and pred in ("d", "z"):
+                characteristic = "voiced_dental_fricative_stopping_or_substitution"
+            elif exp_cat == "consonant" and pred_cat == "consonant":
                 characteristic = "potential_consonant_substitution"
             elif exp_cat == "vowel" and pred_cat == "vowel":
                 characteristic = "potential_vowel_substitution"
             else:
                 characteristic = "potential_phoneme_substitution"
-
             target_phone = exp
-            rec_guidance = exp_profile.get("guidance") or f"Practice clear articulation of target /{exp}/."
-            rec_name = exp_profile.get("name") or f"/{exp}/"
-            recommendation = f"Target {rec_name} was recognized as /{pred}/. {rec_guidance}"
 
         elif op == "deletion":
             characteristic = "potential_consonant_deletion" if exp_cat == "consonant" else "potential_vowel_deletion"
             target_phone = exp
-            rec_guidance = exp_profile.get("guidance") or f"Ensure complete articulation of /{exp}/."
-            rec_name = exp_profile.get("name") or f"/{exp}/"
-            recommendation = f"Target {rec_name} was not detected in this word. {rec_guidance}"
 
         elif op == "insertion":
             characteristic = "potential_consonant_insertion" if pred_cat == "consonant" else "potential_vowel_insertion"
             target_phone = pred
-            recommendation = f"Additional /{pred}/ detected at position {pos}. Practice producing the word without inserting this extra sound."
 
         else:
             continue
 
+        # Evaluate acoustic evidence constraints
+        is_poor_audio = (
+            audio_quality_status in ("too_short", "near_silence", "clipped", "low_energy")
+            or (duration_ms is not None and duration_ms < 80)
+            or segmentation_status not in (None, "valid")
+        )
+
+        if reference_source == "unsupported":
+            validation_stat = "analysis_unavailable"
+            confidence_level = "unavailable"
+            notes_text = f"Target word '{eff_target}' lacks a verified dictionary pronunciation baseline."
+            articulatory_desc = None
+            practice_words = []
+            recommendation = "No articulatory correction assigned: reference pronunciation baseline is unavailable."
+            suggested_target = None
+
+        elif is_poor_audio:
+            validation_stat = "insufficient_acoustic_evidence"
+            confidence_level = "insufficient_evidence"
+            notes_text = (
+                f"Audio segment for '{eff_target}' ({duration_ms}ms, quality: {audio_quality_status}) "
+                f"provides insufficient acoustic resolution for reliable phonetic diagnosis."
+            )
+            articulatory_desc = None
+            practice_words = []
+            recommendation = "No articulatory correction assigned: audio segment has insufficient acoustic evidence."
+            suggested_target = None
+
+        elif speaking_mode == "prompted":
+            # Prompted practice has known target word
+            if characteristic in (
+                "dental_to_alveolar_fricative_substitution",
+                "voiced_dental_fricative_stopping_or_substitution",
+            ):
+                validation_stat = "validated_observation"
+                confidence_level = "high_acoustic_evidence"
+                rec_guidance = exp_profile.get("guidance") or f"Practice clear articulation of target /{exp}/."
+                rec_name = exp_profile.get("name") or f"/{exp}/"
+                recommendation = f"Target {rec_name} was recognized as [{pred}]. {rec_guidance}"
+                articulatory_desc = exp_profile.get("name")
+                practice_words = exp_profile.get("practice_words") or []
+                suggested_target = f"Practice /{target_phone}/ in syllable onsets and codas."
+                if eff_target.lower() != eff_rec.lower():
+                    notes_text = (
+                        f"Prompted practice: Speaker attempted target word '{eff_target}' (transcribed by ASR as '{eff_rec}'). "
+                        f"Acoustic phonemes confirmed /{exp}/ substituted with [{pred}]."
+                    )
+                else:
+                    notes_text = (
+                        f"Prompted practice: Speaker attempted target word '{eff_target}'. "
+                        f"Acoustic phonemes confirmed /{exp}/ substituted with [{pred}]."
+                    )
+            else:
+                validation_stat = "unvalidated_single_occurrence"
+                confidence_level = "requires_validation"
+                rec_name = exp_profile.get("name") or f"/{exp}/"
+                rec_guidance = exp_profile.get("guidance") or f"Practice clear articulation of target /{exp}/."
+                recommendation = f"Target {rec_name} was recognized as [{pred}]. {rec_guidance}"
+                articulatory_desc = exp_profile.get("name")
+                practice_words = exp_profile.get("practice_words") or []
+                suggested_target = f"Practice /{target_phone}/ in syllable onsets and codas."
+                if eff_target.lower() != eff_rec.lower():
+                    notes_text = (
+                        f"Prompted practice: Speaker attempted target word '{eff_target}' (transcribed by ASR as '{eff_rec}'). "
+                        f"Single occurrence of [{pred}] observed for expected /{exp}/; requires validation across multiple utterances."
+                    )
+                else:
+                    notes_text = f"Prompted practice: Single occurrence of [{pred}] observed for expected /{exp}/; requires validation across multiple utterances."
+
+        else:
+            # Spontaneous speech: target is inferred candidate from ASR
+            validation_stat = "candidate_discrepancy_review_required"
+            confidence_level = "candidate_hypothesis"
+            articulatory_desc = None
+            practice_words = []
+            recommendation = "No automatic articulatory correction assigned: spontaneous speech requires human review to confirm intended lexical token."
+            suggested_target = None
+            notes_text = (
+                f"Spontaneous speech mode: Target was inferred from candidate ASR hypothesis ('{eff_rec}'). "
+                f"Observed acoustic variance should be reviewed for lexical ambiguity, coarticulation, or dialectal variation "
+                f"rather than treated as an unquestionable learner error."
+            )
+
         finding = {
-            "word": word,
-            "identified_word": word,
+            "word": eff_target,
+            "target_word": eff_target,
+            "recognized_word": eff_rec,
+            "speaking_mode": speaking_mode,
+            "intent_certainty": "prompt_verified" if speaking_mode == "prompted" else "candidate_inferred",
+            "identified_word": eff_target,
             "observed_characteristic": characteristic,
             "target_phoneme": target_phone,
             "expected_phoneme": exp,
@@ -1141,21 +1246,17 @@ def generate_pronunciation_findings(
             "difference_type": op,
             "phoneme_position": pos,
             "phonetic_category": exp_cat if op != "insertion" else pred_cat,
-            "articulatory_description": exp_profile.get("name") if op != "insertion" else pred_profile.get("name"),
+            "articulatory_description": articulatory_desc,
             "supporting_audio_clip": audio_clip,
             "reference_pronunciation": f"/{expected_phonemes_str}/" if expected_phonemes_str else None,
             "reference_source": reference_source,
             "evidence": "phoneme_sequence_comparison",
-            "confidence_level": "requires_validation",
-            "validation_status": "unvalidated_single_occurrence",
+            "confidence_level": confidence_level,
+            "validation_status": validation_stat,
             "recommendation": recommendation,
-            "suggested_practice_target": f"Practice /{target_phone}/ in syllable onsets and codas.",
-            "practice_words": exp_profile.get("practice_words") or [],
-            "notes": (
-                "Single-instance acoustic observation. Differences may arise from acoustic segmentation, "
-                "connected-speech coarticulation, background noise, or model receptive field limitations "
-                "rather than a persistent learner pronunciation difficulty."
-            ),
+            "suggested_practice_target": suggested_target,
+            "practice_words": practice_words,
+            "notes": notes_text,
         }
         findings.append(finding)
 
@@ -1173,13 +1274,22 @@ def compare_word_phonemes(
     assembly_confidence: Optional[float] = None,
     audio_clip: Optional[str] = None,
     preferred_accent: str = "General English",
+    speaking_mode: str = "prompted",
+    target_word: Optional[str] = None,
+    recognized_word: Optional[str] = None,
+    audio_quality_status: Optional[str] = "normal",
+    duration_ms: Optional[int] = None,
+    segmentation_status: Optional[str] = "valid",
 ) -> Dict[str, Any]:
     """
     Executes the end-to-end Expected vs Predicted Phoneme Comparison for an individual word.
     Produces the target structured schema matching project requirements.
     """
-    # 1. Retrieve expected reference phonemes (supporting multiple variants)
-    ref_result = generator.generate_expected(word, preferred_accent=preferred_accent)
+    eff_target = target_word or word
+    eff_rec = recognized_word or word
+
+    # 1. Retrieve expected reference phonemes from intended target word
+    ref_result = generator.generate_expected(eff_target, preferred_accent=preferred_accent)
 
     # 2. Select best-matching pronunciation variant and align sequences
     if ref_result.all_variants:
@@ -1192,24 +1302,31 @@ def compare_word_phonemes(
         selected_tokens = ref_result.expected_phonemes
         alignment, per_metrics = align_phoneme_sequences(selected_tokens, predicted_tokens)
 
-    # 3. Generate evidence-based pronunciation findings
+    # 3. Generate evidence-constrained pronunciation findings
     findings = generate_pronunciation_findings(
-        word=word,
+        word=eff_target,
         alignment=alignment,
         reference_source=ref_result.reference_source,
         audio_clip=audio_clip,
         expected_phonemes_str=" ".join(selected_tokens),
+        target_word=eff_target,
+        recognized_word=eff_rec,
+        speaking_mode=speaking_mode,
+        audio_quality_status=audio_quality_status,
+        duration_ms=duration_ms,
+        segmentation_status=segmentation_status,
     )
 
     # 4. Determine analysis status and human review recommendation
+    # Note: ASR word confidence is intentionally decoupled from pronunciation accuracy
     requires_review = False
-    if assembly_confidence is not None and assembly_confidence < 0.85:
-        requires_review = True
-    elif per_metrics["phoneme_error_rate"] is not None and per_metrics["phoneme_error_rate"] > 0:
-        requires_review = True
-    elif ref_result.status == "unsupported":
+    if ref_result.status == "unsupported":
         requires_review = True
     elif not predicted_tokens:
+        requires_review = True
+    elif speaking_mode == "spontaneous" and per_metrics["phoneme_error_rate"] and per_metrics["phoneme_error_rate"] > 0:
+        requires_review = True
+    elif audio_quality_status not in (None, "normal", "valid"):
         requires_review = True
 
     if ref_result.status == "unsupported":
@@ -1218,6 +1335,13 @@ def compare_word_phonemes(
     elif not predicted_tokens:
         analysis_status = "prediction_missing"
         comparison_status = "prediction_unavailable"
+    elif speaking_mode == "spontaneous":
+        analysis_status = "completed"
+        comparison_status = (
+            "candidate_concordant"
+            if (per_metrics["phoneme_error_rate"] == 0.0)
+            else "candidate_discrepancy_review_required"
+        )
     else:
         analysis_status = "completed"
         comparison_status = "completed"
@@ -1226,8 +1350,14 @@ def compare_word_phonemes(
     raw_ref_str = ref_result.expected_phonemes_str
 
     return {
-        "word": word,
+        "word": eff_target,
+        "target_word": eff_target,
+        "recognized_word": eff_rec,
+        "speaking_mode": speaking_mode,
+        "intent_certainty": "prompt_verified" if speaking_mode == "prompted" else "candidate_inferred",
         "assembly_confidence": assembly_confidence,
+        "asr_confidence": assembly_confidence,
+        "asr_confidence_note": "AssemblyAI confidence score reflects ASR acoustic/language model reliability, not learner pronunciation accuracy.",
         "predicted_phonemes_raw": raw_pred_str,
         "reference_phonemes_raw": raw_ref_str,
         "predicted_phonemes_normalized": predicted_tokens,
