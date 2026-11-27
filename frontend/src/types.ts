@@ -587,6 +587,8 @@ export interface PostConversationReport {
   generation_method: string;
 }
 
+export type ConversationalMode = 'natural' | 'gentle_guidance' | 'learning_support';
+
 export interface StartDialogueResponse {
   session_id: string;
   turn_id: string;
@@ -594,6 +596,7 @@ export interface StartDialogueResponse {
   intent: string;
   topic: string;
   conversation_complete: boolean;
+  expression_tip?: string | null;
 }
 
 export interface RespondDialogueResponse {
@@ -604,6 +607,43 @@ export interface RespondDialogueResponse {
   topic: string;
   conversation_complete: boolean;
   transcribed_text?: string | null;
+  expression_tip?: string | null;
+}
+
+export interface ExpressionAssistRequest {
+  assist_type: 'help_express' | 'how_else' | 'explain_word' | 'expand_answer' | 'give_example';
+  learner_input: string;
+  context?: string;
+}
+
+export interface ExpressionAssistResponse {
+  assist_type: string;
+  original_input: string;
+  primary_suggestion: string;
+  natural_alternatives: string[];
+  useful_words: string[];
+  example_usage?: string | null;
+}
+
+export interface UsefulExpressionItem {
+  phrase: string;
+  natural_alternative?: string | null;
+  context_note: string;
+  example_sentence: string;
+}
+
+export interface ThoughtDevelopmentHighlight {
+  point_expressed: string;
+  why_it_stood_out: string;
+}
+
+export interface ConversationReflection {
+  conversation_summary: string;
+  topics_covered: string[];
+  useful_expressions: UsefulExpressionItem[];
+  thought_development: ThoughtDevelopmentHighlight[];
+  further_practice_topics: string[];
+  personal_reflection_prompts: string[];
 }
 
 export interface DialogueMessage {
@@ -613,6 +653,7 @@ export interface DialogueMessage {
   timestamp?: string;
   topic?: string;
   intent?: string;
+  expression_tip?: string | null;
 }
 
 export interface ConversationSessionRecord {
@@ -624,6 +665,9 @@ export interface ConversationSessionRecord {
   total_duration_seconds: number;
   turns: ConversationTurn[];
   report?: PostConversationReport | null;
+  reflection?: ConversationReflection | null;
+  topic?: string;
+  mode?: ConversationalMode;
   status: 'completed' | 'processing' | 'failed';
   error_message?: string;
 }

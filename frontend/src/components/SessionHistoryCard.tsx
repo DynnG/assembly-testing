@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { History, Trash2, Eye, CheckCircle2, XCircle, FileAudio, Clock } from 'lucide-react';
+import { History, Trash2, Eye, Clock, Sparkles, MessageCircle } from 'lucide-react';
 import type { TestSessionRecord, ConversationSessionRecord } from '../types';
 
 interface SessionHistoryCardProps {
@@ -32,10 +32,10 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
           <div className="p-2 bg-slate-800 rounded-lg text-slate-400">
             <History className="w-5 h-5" />
           </div>
-          <h2 className="text-base font-semibold text-white">Session History</h2>
+          <h2 className="text-base font-semibold text-white">Conversation History</h2>
         </div>
         <p className="text-xs text-slate-500 py-4">
-          No sessions executed yet. Completing a conversation or benchmark test will store the results here for instant recall without re-running analysis.
+          No conversation sessions completed yet. Practice speaking with your companion and your session reflections will appear here.
         </p>
       </div>
     );
@@ -45,18 +45,18 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg shadow-black/20 space-y-4">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
         <div className="flex items-center gap-2.5">
-          <div className="p-2 bg-indigo-500/10 border border-indigo-500/20 rounded-lg text-indigo-400">
+          <div className="p-2 bg-teal-500/10 border border-teal-500/20 rounded-lg text-teal-400">
             <History className="w-5 h-5" />
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="text-base font-semibold text-white">Session History</h2>
-              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">
-                {conversationHistory.length} conversations • {history.length} benchmarks
+              <h2 className="text-base font-semibold text-white">Conversation & Practice History</h2>
+              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-teal-300 font-mono">
+                {conversationHistory.length} conversations
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Ephemeral in-memory history. Revisit completed sessions instantly without re-running jobs.
+              Revisit your past conversations, useful expressions, and reflections.
             </p>
           </div>
         </div>
@@ -74,16 +74,18 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
             >
               Conversations ({conversationHistory.length})
             </button>
-            <button
-              onClick={() => setActiveTab('benchmark')}
-              className={`px-3 py-1 rounded-md font-medium transition-all ${
-                activeTab === 'benchmark'
-                  ? 'bg-indigo-600 text-white shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Benchmarks ({history.length})
-            </button>
+            {history.length > 0 && (
+              <button
+                onClick={() => setActiveTab('benchmark')}
+                className={`px-3 py-1 rounded-md font-medium transition-all ${
+                  activeTab === 'benchmark'
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Benchmarks ({history.length})
+              </button>
+            )}
           </div>
 
           <button
@@ -112,55 +114,60 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
             </p>
           ) : (
             conversationHistory.map((sess, idx) => {
+              const reflection = sess.reflection;
               const report = sess.report;
-              const wpm = report?.section_b_fluency_analysis.speech_rate_wpm;
-              const wordCount = report?.section_a_transcription_and_timing.word_timestamps_count;
+              const summarySnippet =
+                reflection?.conversation_summary ||
+                report?.section_a_speaking_session?.overall_recording_assessment ||
+                report?.section_a_transcription_and_timing?.full_transcript ||
+                'Conversation session';
+
+              const topicLabel =
+                sess.topic?.replace(/_/g, ' ') ||
+                reflection?.topics_covered?.[0] ||
+                'Everyday Conversation';
 
               return (
                 <div
                   key={`${sess.session_id}-${idx}`}
-                  className="p-3 bg-slate-950/60 border border-slate-800/80 rounded-lg hover:border-slate-700 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  className="p-3.5 bg-slate-950/60 border border-slate-800/80 rounded-lg hover:border-slate-700 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3"
                 >
-                  <div className="space-y-1 min-w-0 flex-1">
+                  <div className="space-y-1.5 min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[11px] font-mono font-semibold px-1.5 py-0.5 rounded bg-slate-800 text-teal-400">
-                        {sess.session_id}
+                      <span className="text-xs font-semibold px-2 py-0.5 rounded bg-teal-950/80 text-teal-300 border border-teal-500/30 capitalize flex items-center gap-1">
+                        <MessageCircle className="w-3 h-3 text-teal-400" />
+                        {topicLabel}
                       </span>
-                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-300 border border-teal-500/30 flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3 text-teal-400" />
-                        {sess.status}
-                      </span>
-                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/20 text-purple-300">
-                        {sess.speaking_mode}
-                      </span>
-                      {wpm && (
-                        <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-cyan-500/10 border border-cyan-500/20 text-cyan-300">
-                          {wpm} WPM
+                      {sess.mode && (
+                        <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 capitalize">
+                          {sess.mode.replace(/_/g, ' ')}
                         </span>
                       )}
                       <span className="text-[11px] text-slate-400 flex items-center gap-1">
                         <Clock className="w-3 h-3 text-slate-500" />
-                        {sess.total_duration_seconds.toFixed(1)}s ({sess.turn_count} turns)
+                        {sess.total_duration_seconds.toFixed(0)}s • {sess.turn_count} turns
                       </span>
                     </div>
 
-                    {/* Preview transcript */}
-                    <p className="text-xs text-slate-300 font-mono line-clamp-1 italic">
-                      "{report?.section_a_transcription_and_timing.full_transcript || 'No transcript text'}"
+                    <p className="text-xs text-slate-300 line-clamp-2 leading-relaxed">
+                      {summarySnippet}
                     </p>
 
                     <div className="text-[10px] text-slate-500">
-                      Recorded at {sess.timestamp} • {wordCount || 0} recognized words
+                      Practiced at {sess.timestamp}
+                      {reflection?.useful_expressions && (
+                        <span> • {reflection.useful_expressions.length} useful expressions discovered</span>
+                      )}
                     </div>
                   </div>
 
-                  {sess.report && onSelectConversationSession && (
+                  {(sess.reflection || sess.report) && onSelectConversationSession && (
                     <button
                       onClick={() => onSelectConversationSession(sess)}
                       className="px-3 py-1.5 rounded bg-slate-800 hover:bg-teal-600 hover:text-white text-slate-300 text-xs font-medium flex items-center gap-1.5 transition-colors shrink-0 self-end sm:self-center"
                     >
-                      <Eye className="w-3.5 h-3.5" />
-                      <span>Revisit Report</span>
+                      <Sparkles className="w-3.5 h-3.5 text-teal-400" />
+                      <span>View Reflection</span>
                     </button>
                   )}
                 </div>
@@ -199,62 +206,18 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
                             : 'bg-rose-500/10 text-rose-300 border-rose-500/30'
                         }`}
                       >
-                        {isSuccess ? (
-                          <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                        ) : (
-                          <XCircle className="w-3 h-3 text-rose-400" />
-                        )}
                         {item.status}
                       </span>
-
-                      {item.word_error_rate_percent !== null && (
-                        <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-indigo-500/10 border border-indigo-500/20 text-indigo-300">
-                          WER: {item.word_error_rate_percent}%
-                        </span>
-                      )}
-
-                      {item.speech_rate_wpm !== null && (
-                        <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-teal-500/10 border border-teal-500/20 text-teal-300">
-                          {item.speech_rate_wpm} WPM
-                        </span>
-                      )}
-
-                      <span className="text-[11px] text-slate-400 truncate flex items-center gap-1">
-                        <FileAudio className="w-3 h-3 text-slate-500 shrink-0" />
-                        {item.audio_file}
-                      </span>
-                    </div>
-
-                    <p className="text-xs text-slate-300 font-mono line-clamp-1 italic">
-                      {item.assemblyai_transcript
-                        ? `"${item.assemblyai_transcript}"`
-                        : item.exclusion_reason || '[No transcript text]'}
-                    </p>
-
-                    <div className="flex flex-wrap items-center gap-3 text-[10px] text-slate-500">
-                      <span>{item.timestamp}</span>
-                      {item.audio_duration_seconds !== undefined && (
-                        <span className="flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {item.audio_duration_seconds}s audio
-                        </span>
-                      )}
-                      {item.pause_count > 0 && (
-                        <span>
-                          {item.pause_count} pauses ({item.mean_pause_duration_seconds}s avg)
-                        </span>
-                      )}
-                      <span className="text-slate-400">Condition: {item.recording_condition}</span>
                     </div>
                   </div>
 
-                  {isSuccess && (
+                  {item.assemblyai_transcript && onSelectHistoryItem && (
                     <button
                       onClick={() => onSelectHistoryItem(item)}
-                      className="px-3 py-1.5 rounded bg-slate-800 hover:bg-teal-600 hover:text-white text-slate-300 text-xs font-medium flex items-center gap-1.5 transition-colors shrink-0 self-end sm:self-center"
+                      className="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1.5 transition-colors shrink-0 self-end sm:self-center"
                     >
                       <Eye className="w-3.5 h-3.5" />
-                      <span>Inspect</span>
+                      <span>Revisit Test</span>
                     </button>
                   )}
                 </div>
@@ -266,4 +229,3 @@ export const SessionHistoryCard: React.FC<SessionHistoryCardProps> = ({
     </div>
   );
 };
-

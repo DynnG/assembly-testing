@@ -367,7 +367,8 @@ export async function analyzeConversationSessionStream(
  */
 export async function startDialogue(
   topic?: string,
-  sessionId?: string
+  sessionId?: string,
+  mode?: string
 ): Promise<import('../types').StartDialogueResponse> {
   const res = await fetch(`${API_BASE}/conversation/start-dialogue`, {
     method: 'POST',
@@ -377,7 +378,8 @@ export async function startDialogue(
     },
     body: JSON.stringify({
       session_id: sessionId,
-      topic: topic || 'daily_life_and_interests',
+      topic: topic || 'everyday_conversations',
+      mode: mode || 'natural',
     }),
   });
 
@@ -397,6 +399,7 @@ export async function respondDialogue(payload: {
   audio_base64?: string;
   history: Array<{ speaker: string; text: string; topic?: string }>;
   current_topic?: string;
+  mode?: string;
 }): Promise<import('../types').RespondDialogueResponse> {
   const res = await fetch(`${API_BASE}/conversation/respond-dialogue`, {
     method: 'POST',
@@ -411,6 +414,60 @@ export async function respondDialogue(payload: {
     res,
     'Failed to generate conversational follow-up'
   );
+}
+
+/**
+ * Requests on-demand English expression or vocabulary assistance.
+ */
+export async function requestExpressionAssist(
+  req: import('../types').ExpressionAssistRequest
+): Promise<import('../types').ExpressionAssistResponse> {
+  const res = await fetch(`${API_BASE}/conversation/express-assist`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(req),
+  });
+
+  return await parseResponse<import('../types').ExpressionAssistResponse>(
+    res,
+    'Failed to generate expression assistance'
+  );
+}
+
+/**
+ * Generates a supportive post-conversation reflection without scores or grading.
+ */
+export async function reflectConversationSession(payload: {
+  session_id: string;
+  topic?: string;
+  turns: Array<{
+    turn_id: string;
+    speaker?: string;
+    transcript?: string;
+    text?: string;
+  }>;
+}): Promise<{
+  success: boolean;
+  session_id: string;
+  reflection: import('../types').ConversationReflection;
+}> {
+  const res = await fetch(`${API_BASE}/conversation/reflect-session`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  return await parseResponse<{
+    success: boolean;
+    session_id: string;
+    reflection: import('../types').ConversationReflection;
+  }>(res, 'Failed to generate conversation reflection');
 }
 
 /**

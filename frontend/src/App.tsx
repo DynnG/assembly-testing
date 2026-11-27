@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Header } from './components/Header';
-import { ResearchLimitationsCard } from './components/ResearchLimitationsCard';
+import { ConversationOrientationCard } from './components/ConversationOrientationCard';
 import { ApiStatusCard } from './components/ApiStatusCard';
 import { TestCaseSelectorCard } from './components/TestCaseSelectorCard';
 import { AudioInputCard } from './components/AudioInputCard';
@@ -13,8 +13,8 @@ import { EvaluationResultsCard } from './components/EvaluationResultsCard';
 import { ExportCard } from './components/ExportCard';
 import { SessionHistoryCard } from './components/SessionHistoryCard';
 import { ConversationRecorderCard } from './components/ConversationRecorderCard';
-import { PostConversationProgressCard } from './components/PostConversationProgressCard';
 import { PostConversationReportCard } from './components/PostConversationReportCard';
+import { ConversationReflectionCard } from './components/ConversationReflectionCard';
 
 import {
   getHealth,
@@ -22,7 +22,7 @@ import {
   testGeminiConnection,
   transcribeAudio,
   evaluateMetrics,
-  analyzeConversationSessionStream,
+  reflectConversationSession,
 } from './services/api';
 import { analyzeAudioSilence } from './services/audioAnalysis';
 import { STANDARD_TEST_SCENARIOS } from './data/testScenarios';
@@ -37,19 +37,22 @@ import type {
   PostConversationReport,
   ProcessingStage,
   ConversationSessionRecord,
+  ConversationReflection,
+  ConversationalMode,
 } from './types';
-import { Play, AlertCircle, ToggleRight, ToggleLeft, Volume2, MessageSquare, FileAudio } from 'lucide-react';
+import { Play, AlertCircle, ToggleRight, ToggleLeft, Volume2, FileAudio, Bot } from 'lucide-react';
 
 export const App: React.FC = () => {
   // Mode: 'conversation' (Conversation-First Post-Assessment) vs 'benchmark' (Test Bench)
   const [appMode, setAppMode] = useState<'conversation' | 'benchmark'>('conversation');
 
-  // Conversational Assessment state
+  // Conversational Assessment & Reflection state
   const [conversationStage, setConversationStage] = useState<ProcessingStage>('recording');
   const [conversationStageMsg, setConversationStageMsg] = useState<string>('Ready for conversational turns');
   const [conversationProgress, setConversationProgress] = useState<number>(0);
   const [isConversationAssessing, setIsConversationAssessing] = useState<boolean>(false);
   const [activeConversationReport, setActiveConversationReport] = useState<PostConversationReport | null>(null);
+  const [activeReflection, setActiveReflection] = useState<ConversationReflection | null>(null);
   const [conversationHistory, setConversationHistory] = useState<ConversationSessionRecord[]>([]);
 
   // Backend & API Key state
@@ -465,80 +468,74 @@ export const App: React.FC = () => {
     }
   };
 
-  // Conversational Assessment Handlers
+  // Conversational Companion Handlers
   const handleSessionComplete = async (
     turns: ConversationTurn[],
-    mode: 'prompted' | 'spontaneous',
-    target?: string
+    topic: string,
+    mode: ConversationalMode
   ) => {
     if (turns.length === 0 || isConversationAssessing) return;
 
     const sessionId = `session_${Date.now()}`;
     setIsConversationAssessing(true);
-    setConversationStage('session_ended');
-    setConversationStageMsg('Conversation completed. Starting post-conversation assessment pipeline...');
-    setConversationProgress(5);
+    setConversationStage('generating_feedback');
+    setConversationStageMsg('Reflecting on your conversation and extracting useful expressions...');
+    setConversationProgress(50);
+    setActiveReflection(null);
     setActiveConversationReport(null);
 
     try {
-      const report = await analyzeConversationSessionStream(
-        {
-          session_id: sessionId,
-          speaking_mode: mode,
-          prompt_target: target,
-          preferred_accent: 'General English',
-          min_pause_duration_seconds: minPauseDuration,
-          silence_threshold_db: silenceThresholdDb,
-          turns: turns.map((t) => ({
-            turn_id: t.turn_id,
-            audio_base64: t.audio_base64,
-            transcript: t.transcript,
-            duration_seconds: t.duration_seconds,
-            prompt_target: t.prompt_target,
-            speaking_mode: t.speaking_mode,
-            detected_pauses: t.detected_pauses,
-          })),
-        },
-        (event) => {
-          setConversationStage(event.stage);
-          setConversationStageMsg(event.message);
-          setConversationProgress(event.progress);
-          if (event.report) {
-            setActiveConversationReport(event.report);
-          }
-        }
-      );
-
-      setActiveConversationReport(report);
-      setConversationStage('completed');
-      setConversationStageMsg('Post-conversation assessment completed.');
-      setConversationProgress(100);
-
-      // Save to Conversation Session History
-      const sessionRecord: ConversationSessionRecord = {
+      const res = await reflectConversationSession({
         session_id: sessionId,
-        timestamp: new Date().toLocaleTimeString(),
-        speaking_mode: mode,
-        prompt_target: target,
-        turn_count: turns.length,
-        total_duration_seconds: turns.reduce((acc, t) => acc + t.duration_seconds, 0),
-        turns: turns,
-        report: report,
-        status: 'completed',
-      };
-      setConversationHistory((prev) => [sessionRecord, ...prev]);
+        topic: topic,
+        turns: turns.map((t) => ({
+          turn_id: t.turn_id,
+          speaker: 'learner',
+          transcript: t.transcript || '',
+        })),
+      });
+
+      if (res && res.reflection) {
+        setActiveReflection(res.reflection);
+        setConversationStage('completed');
+        setConversationStageMsg('Conversation reflection ready.');
+        setConversationProgress(100);
+
+        // Save to Conversation Session History
+        const sessionRecord: ConversationSessionRecord = {
+          session_id: sessionId,
+          timestamp: new Date().toLocaleTimeString(),
+          speaking_mode: 'spontaneous',
+          turn_count: turns.length,
+          total_duration_seconds: turns.reduce((acc, t) => acc + (t.duration_seconds || 0), 0),
+          turns: turns,
+          reflection: res.reflection,
+          topic: topic,
+          mode: mode,
+          status: 'completed',
+        };
+        setConversationHistory((prev) => [sessionRecord, ...prev]);
+      }
     } catch (err: any) {
-      console.error('Session processing error:', err);
+      console.error('Session reflection error:', err);
       setConversationStage('error');
-      setConversationStageMsg(err.message || 'Post-conversation assessment encountered an error.');
+      setConversationStageMsg(err.message || 'Reflection generation encountered an issue.');
     } finally {
       setIsConversationAssessing(false);
     }
   };
 
   const handleRevisitConversationSession = (session: ConversationSessionRecord) => {
-    if (session.report) {
+    if (session.reflection) {
+      setActiveReflection(session.reflection);
+      setActiveConversationReport(null);
+      setConversationStage('completed');
+      setConversationStageMsg(`Viewing reflection for ${session.session_id}`);
+      setConversationProgress(100);
+      setAppMode('conversation');
+    } else if (session.report) {
       setActiveConversationReport(session.report);
+      setActiveReflection(null);
       setConversationStage('completed');
       setConversationStageMsg(`Reopened completed report for ${session.session_id}`);
       setConversationProgress(100);
@@ -553,8 +550,8 @@ export const App: React.FC = () => {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {/* Research Limitations & Measurement Protocols Banner */}
-        <ResearchLimitationsCard />
+        {/* Welcome & Philosophy Banner */}
+        <ConversationOrientationCard />
 
         {/* API Connection & Backend Status */}
         <ApiStatusCard
@@ -571,7 +568,7 @@ export const App: React.FC = () => {
           geminiTestResult={geminiTestResult}
         />
 
-        {/* Architecture Mode Navigation: Conversation-First vs Benchmark Test Bench */}
+        {/* Navigation Mode */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-2.5 rounded-xl shadow-lg">
           <div className="flex items-center gap-2">
             <button
@@ -582,10 +579,10 @@ export const App: React.FC = () => {
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              <MessageSquare className="w-4 h-4" />
-              <span>Conversation-First Assessment</span>
+              <Bot className="w-4 h-4" />
+              <span>AI English Conversation Companion</span>
               <span className="text-[10px] bg-slate-950/40 px-1.5 py-0.5 rounded-full font-mono">
-                Primary Flow
+                Primary Space
               </span>
             </button>
             <button
@@ -597,45 +594,52 @@ export const App: React.FC = () => {
               }`}
             >
               <FileAudio className="w-4 h-4" />
-              <span>Benchmark Test Bench (10 Scenarios)</span>
+              <span>Benchmark Test Bench (Advanced)</span>
             </button>
           </div>
 
           <div className="text-xs text-slate-400 hidden sm:block">
             {appMode === 'conversation'
-              ? 'Uninterrupted dialogue with post-conversation sequential assessment'
-              : 'Isolated audio upload & reference transcript WER evaluation'}
+              ? 'Judgment-free English speaking practice with expression assistance & reflection'
+              : 'Technical ASR and acoustic measurement test bench'}
           </div>
         </div>
 
-        {/* VIEW 1: CONVERSATION-FIRST ASSESSMENT (Primary Flow) */}
+        {/* VIEW 1: AI CONVERSATION COMPANION (Primary Experience) */}
         {appMode === 'conversation' && (
           <div className="space-y-6">
-            {/* Conversation Multi-Turn Dialogue Card */}
+            {/* Conversation Companion Dialogue & Expression Assistance Card */}
             <ConversationRecorderCard
               onSessionComplete={handleSessionComplete}
               isProcessing={isConversationAssessing}
-              speakingMode={speakingMode}
-              onSpeakingModeChange={setSpeakingMode}
-              promptTarget={promptTarget}
-              onPromptTargetChange={setPromptTarget}
             />
 
-            {/* Sequential Real Backend Progress Stepper */}
-            {(isConversationAssessing || conversationStage !== 'recording') && (
-              <PostConversationProgressCard
-                currentStage={conversationStage}
-                stageMessage={conversationStageMsg}
-                progressPercent={conversationProgress}
-              />
+            {/* Reflection Processing Indicator */}
+            {isConversationAssessing && (
+              <div className="bg-slate-900 border border-teal-500/30 rounded-xl p-5 shadow-lg flex items-center gap-4">
+                <div className="w-8 h-8 rounded-full border-2 border-teal-500 border-t-transparent animate-spin shrink-0" />
+                <div className="space-y-1">
+                  <h4 className="text-sm font-semibold text-white">
+                    Reflecting on Your Conversation
+                  </h4>
+                  <p className="text-xs text-slate-400">
+                    {conversationStageMsg} ({conversationProgress}%) • Stage: {conversationStage}
+                  </p>
+                </div>
+              </div>
             )}
 
-            {/* Consolidated 5-Section Post-Conversation Assessment Report */}
-            {activeConversationReport && (
+            {/* Supportive Conversation Reflection Card (5 Sections, Zero Scores) */}
+            {activeReflection && (
+              <ConversationReflectionCard reflection={activeReflection} />
+            )}
+
+            {/* Fallback legacy report if revisiting a legacy report */}
+            {activeConversationReport && !activeReflection && (
               <PostConversationReportCard report={activeConversationReport} />
             )}
 
-            {/* Conversation Session History */}
+            {/* Conversation History & Reflections */}
             <SessionHistoryCard
               history={sessionHistory}
               conversationHistory={conversationHistory}

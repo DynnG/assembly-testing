@@ -47,6 +47,9 @@ from gemini_service import (
     GeminiService,
     ConversationalResponseModel,
     PostAssessmentInterpretationModel,
+    ExpressionAssistRequestModel,
+    ExpressionAssistResponseModel,
+    ConversationReflectionModel,
 )
 
 logger = logging.getLogger("articula.main")
@@ -1325,12 +1328,14 @@ async def analyze_conversation_session_stream_endpoint(req: AnalyzeConversationS
 
 
 # ============================================================================
-# Phase 11: Conversational AI Dialogue Partner (Gemini 3.5 Flash-Lite)
+# Phase 11: Conversational AI Companion (Gemini 3.5 Flash-Lite)
+# Articula: Your Space to Speak, Express, and Grow
 # ============================================================================
 
 class StartDialogueRequest(BaseModel):
     session_id: Optional[str] = None
-    topic: Optional[str] = "daily_life_and_interests"
+    topic: Optional[str] = "everyday_conversations"
+    mode: Optional[str] = "natural"
 
 
 class DialogueTurnContext(BaseModel):
@@ -1345,7 +1350,8 @@ class RespondDialogueRequest(BaseModel):
     learner_transcript: Optional[str] = None
     audio_base64: Optional[str] = None
     history: List[DialogueTurnContext] = []
-    current_topic: Optional[str] = "daily_life_and_interests"
+    current_topic: Optional[str] = "everyday_conversations"
+    mode: Optional[str] = "natural"
 
 
 class TranscribeTurnRequest(BaseModel):
@@ -1353,15 +1359,22 @@ class TranscribeTurnRequest(BaseModel):
     turn_id: Optional[str] = "turn_1"
 
 
+class ReflectSessionRequest(BaseModel):
+    session_id: str
+    topic: Optional[str] = "everyday_conversations"
+    turns: List[Dict[str, Any]] = []
+
+
 @app.post("/conversation/start-dialogue", summary="Initiate conversation with Gemini opening question")
 async def start_dialogue_endpoint(req: StartDialogueRequest):
     """
     Initiates a new conversational session.
-    Gemini 3.5 Flash-Lite generates a friendly, natural opening question.
+    Gemini 3.5 Flash-Lite generates a friendly, natural opening question tailored to category & mode.
     """
     import uuid
     session_id = req.session_id or f"session_{uuid.uuid4().hex[:8]}"
-    topic = req.topic or "daily_life_and_interests"
+    topic = req.topic or "everyday_conversations"
+    mode = req.mode or "natural"
 
     gemini_svc = GeminiService()
     res = await gemini_svc.generate_conversational_response(
@@ -1369,6 +1382,7 @@ async def start_dialogue_endpoint(req: StartDialogueRequest):
         history=[],
         current_topic=topic,
         is_opening=True,
+        mode=mode,
     )
 
     return {
@@ -1378,6 +1392,7 @@ async def start_dialogue_endpoint(req: StartDialogueRequest):
         "intent": res.intent,
         "topic": res.topic,
         "conversation_complete": res.conversation_complete,
+        "expression_tip": res.expression_tip,
     }
 
 
@@ -1411,7 +1426,6 @@ async def respond_dialogue_endpoint(req: RespondDialogueRequest):
                 learner_text = stt_res.get("text", "").strip()
         except Exception as stt_err:
             logger.warning(f"Live turn transcription failed or timed out: {stt_err}")
-            # Graceful recovery: learner_text remains empty, prompting clarification
 
     # Format history for Gemini
     history_dicts = [{"speaker": h.speaker, "text": h.text} for h in req.history]
@@ -1420,9 +1434,10 @@ async def respond_dialogue_endpoint(req: RespondDialogueRequest):
     gemini_res = await gemini_svc.generate_conversational_response(
         session_id=req.session_id,
         history=history_dicts,
-        current_topic=req.current_topic or "daily_life_and_interests",
+        current_topic=req.current_topic or "everyday_conversations",
         learner_response=learner_text,
         is_opening=False,
+        mode=req.mode or "natural",
     )
 
     # Next turn id calculation
@@ -1442,6 +1457,46 @@ async def respond_dialogue_endpoint(req: RespondDialogueRequest):
         "topic": gemini_res.topic,
         "conversation_complete": gemini_res.conversation_complete,
         "transcribed_text": learner_text if learner_text else None,
+        "expression_tip": gemini_res.expression_tip,
+    }
+
+
+@app.post("/conversation/express-assist", summary="On-demand English expression and vocabulary assistance")
+async def express_assist_endpoint(req: ExpressionAssistRequestModel):
+    """
+    Provides on-demand expression support for learners:
+    - help_express: Find words to frame an idea
+    - how_else: Alternative ways to say something (casual, polite, native)
+    - explain_word: Meaning, nuance, and conversational examples
+    - expand_answer: Guided elaboration points and structures
+    - give_example: Conversational examples
+    """
+    gemini_svc = GeminiService()
+    res = await gemini_svc.generate_expression_assistance(
+        assist_type=req.assist_type,
+        learner_input=req.learner_input,
+        context=req.context,
+    )
+    return res
+
+
+@app.post("/conversation/reflect-session", summary="Generate supportive post-conversation reflection")
+async def reflect_session_endpoint(req: ReflectSessionRequest):
+    """
+    Generates a judgment-free, supportive post-conversation reflection.
+    Highlights summary of thoughts shared, useful expressions, thought development,
+    and personal reflection questions. No numerical scores, no phoneme error rates.
+    """
+    gemini_svc = GeminiService()
+    reflection = await gemini_svc.generate_conversation_reflection(
+        session_id=req.session_id,
+        turns=req.turns,
+        topic=req.topic or "everyday_conversations",
+    )
+    return {
+        "success": True,
+        "session_id": req.session_id,
+        "reflection": reflection,
     }
 
 
